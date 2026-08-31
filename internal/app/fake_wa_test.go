@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -12,6 +13,7 @@ import (
 	"github.com/openclaw/wacli/internal/fsutil"
 	"github.com/openclaw/wacli/internal/wa"
 	"go.mau.fi/whatsmeow"
+	"go.mau.fi/whatsmeow/appstate"
 	waProto "go.mau.fi/whatsmeow/binary/proto"
 	"go.mau.fi/whatsmeow/proto/waCommon"
 	"go.mau.fi/whatsmeow/proto/waE2E"
@@ -32,11 +34,16 @@ type fakeWA struct {
 	nextHandlerID uint32
 	handlers      map[uint32]func(interface{})
 
-	connectEvents []interface{}
-	connectErrs   []error
-	connectCalls  int
-	connectDelay  time.Duration
-	downloadDelay time.Duration
+	connectEvents  []interface{}
+	connectErrs    []error
+	connectCalls   int
+	connectDelay   time.Duration
+	connectStarted chan struct{}
+	downloadDelay  time.Duration
+	downloadErr    error
+
+	onMediaRetry       func(info *types.MessageInfo, mediaKey []byte) interface{}
+	mediaRetryReceipts []string
 
 	contacts map[types.JID]types.ContactInfo
 	groups   map[types.JID]*types.GroupInfo
@@ -54,19 +61,27 @@ type fakeWA struct {
 	decryptSecretFunc           func(evt *events.Message) (*waE2E.Message, error)
 	onDemandHistory             func(lastKnown types.MessageInfo, count int) *events.HistorySync
 	onDemandEvent               func(lastKnown types.MessageInfo, count int) interface{}
+	onDemandErr                 error
 	downloadHistory             func(notif *waE2E.HistorySyncNotification) (*waHistorySync.HistorySync, error)
 	deleteHistoryCalls          []*waE2E.HistorySyncNotification
 	appStateRecoveryErr         error
+	onAppStateRecovery          func(name string)
 	appStateFetchErr            error
+	appStateFetchErrs           []error
 	appStateFetchEvent          func(name string, fullSync, onlyIfNotSynced bool) interface{}
+	archiveEvent                func() interface{}
+	archiveErr                  error
 	archiveCalls                []fakeArchiveCall
 	pinCalls                    []fakePinCall
 	muteCalls                   []fakeMuteCall
 	markReadCalls               []fakeMarkReadCall
+	markReadBeforeApply         func()
+	manualHistorySyncCalls      []bool
+	appStateRecoveries          []string
+	appStateFetches             []fakeAppStateFetch
 
-	manualHistorySyncCalls []bool
-	appStateRecoveries     []string
-	appStateFetches        []fakeAppStateFetch
+	presenceCalls   []types.Presence
+	sendPresenceErr error
 }
 
 type fakeArchiveCall struct {
@@ -165,6 +180,12 @@ func (f *fakeWA) Connect(ctx context.Context, opts wa.ConnectOptions) error {
 		return nil
 	}
 	f.connectCalls++
+	if f.connectStarted != nil {
+		select {
+		case f.connectStarted <- struct{}{}:
+		default:
+		}
+	}
 	authed := f.authed
 	var connectErr error
 	if len(f.connectErrs) > 0 {
@@ -194,6 +215,9 @@ func (f *fakeWA) Connect(ctx context.Context, opts wa.ConnectOptions) error {
 			return ctx.Err()
 		}
 	}
+	if authed && !opts.SuppressInitialAvailablePresence {
+		_ = f.SendPresence(ctx, types.PresenceAvailable)
+	}
 	f.emit(&events.Connected{})
 	for _, e := range eventsToEmit {
 		f.emit(e)
@@ -216,8 +240,9 @@ func (f *fakeWA) RemoveEventHandler(id uint32) {
 	delete(f.handlers, id)
 }
 
-func (f *fakeWA) ReconnectWithBackoff(ctx context.Context, minDelay, maxDelay time.Duration) error {
-	return f.Connect(ctx, wa.ConnectOptions{AllowQR: false})
+func (f *fakeWA) ReconnectWithBackoff(ctx context.Context, minDelay, maxDelay time.Duration, opts wa.ConnectOptions) error {
+	opts.AllowQR = false
+	return f.Connect(ctx, opts)
 }
 
 func (f *fakeWA) ResolveChatName(ctx context.Context, chat types.JID, pushName string) string {
@@ -557,6 +582,13 @@ func (f *fakeWA) SendChatPresence(ctx context.Context, jid types.JID, state type
 	return nil
 }
 
+func (f *fakeWA) SendPresence(ctx context.Context, presence types.Presence) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.presenceCalls = append(f.presenceCalls, presence)
+	return f.sendPresenceErr
+}
+
 func (f *fakeWA) DecryptReaction(ctx context.Context, reaction *events.Message) (*waProto.ReactionMessage, error) {
 	if f.decryptReactionErr != nil {
 		return nil, f.decryptReactionErr
@@ -635,6 +667,9 @@ func (f *fakeWA) DownloadMediaToFile(ctx context.Context, directPath string, enc
 			return 0, ctx.Err()
 		}
 	}
+	if f.downloadErr != nil {
+		return 0, f.downloadErr
+	}
 	if err := os.MkdirAll(filepath.Dir(targetPath), 0o700); err != nil {
 		return 0, err
 	}
@@ -648,26 +683,54 @@ func (f *fakeWA) DownloadMediaToFile(ctx context.Context, directPath string, enc
 	return st.Size(), nil
 }
 
+func (f *fakeWA) SendMediaRetryReceipt(ctx context.Context, info *types.MessageInfo, mediaKey []byte) error {
+	f.mu.Lock()
+	f.mediaRetryReceipts = append(f.mediaRetryReceipts, string(info.ID))
+	hook := f.onMediaRetry
+	f.mu.Unlock()
+	if hook != nil {
+		if evt := hook(info, mediaKey); evt != nil {
+			f.emit(evt)
+		}
+	}
+	return nil
+}
+
 func (f *fakeWA) RequestHistorySyncOnDemand(ctx context.Context, lastKnown types.MessageInfo, count int) (types.MessageID, error) {
 	f.mu.Lock()
+	if f.onDemandErr != nil {
+		err := f.onDemandErr
+		f.mu.Unlock()
+		return "", err
+	}
 	eventCB := f.onDemandEvent
 	cb := f.onDemandHistory
 	f.mu.Unlock()
 	if eventCB != nil {
-		f.emit(eventCB(lastKnown, count))
+		if evt := eventCB(lastKnown, count); evt != nil {
+			f.emit(evt)
+		}
 	} else if cb != nil {
-		f.emit(cb(lastKnown, count))
+		if evt := cb(lastKnown, count); evt != nil {
+			f.emit(evt)
+		}
 	}
 	return types.MessageID("req"), nil
 }
 
 func (f *fakeWA) RequestAppStateRecovery(ctx context.Context, name string) (types.MessageID, error) {
 	f.mu.Lock()
-	defer f.mu.Unlock()
 	if f.appStateRecoveryErr != nil {
-		return "", f.appStateRecoveryErr
+		err := f.appStateRecoveryErr
+		f.mu.Unlock()
+		return "", err
 	}
 	f.appStateRecoveries = append(f.appStateRecoveries, name)
+	hook := f.onAppStateRecovery
+	f.mu.Unlock()
+	if hook != nil {
+		hook(name)
+	}
 	return types.MessageID("recovery-req"), nil
 }
 
@@ -675,32 +738,46 @@ func (f *fakeWA) DeleteMessageForMe(ctx context.Context, info types.MessageInfo,
 	return nil
 }
 
-func (f *fakeWA) ArchiveChat(ctx context.Context, target types.JID, archive bool, lastMsgTS time.Time, lastMsgKey *waCommon.MessageKey) error {
+func (f *fakeWA) ArchiveChat(ctx context.Context, target types.JID, archive bool, lastMsgTS time.Time, lastMsgKey *waCommon.MessageKey, beforeApply func()) ([]interface{}, error) {
 	f.mu.Lock()
-	defer f.mu.Unlock()
 	f.archiveCalls = append(f.archiveCalls, fakeArchiveCall{target: target, archive: archive, lastMsgTS: lastMsgTS, lastMsgKey: lastMsgKey})
-	return nil
+	eventCB := f.archiveEvent
+	f.mu.Unlock()
+	beforeApply()
+	if eventCB != nil {
+		if evt := eventCB(); evt != nil {
+			return []interface{}{evt}, f.archiveErr
+		}
+	}
+	return nil, f.archiveErr
 }
 
-func (f *fakeWA) PinChat(ctx context.Context, target types.JID, pin bool) error {
+func (f *fakeWA) PinChat(ctx context.Context, target types.JID, pin bool, beforeApply func()) ([]interface{}, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.pinCalls = append(f.pinCalls, fakePinCall{target: target, pin: pin})
-	return nil
+	beforeApply()
+	return nil, nil
 }
 
-func (f *fakeWA) MuteChat(ctx context.Context, target types.JID, mute bool, duration time.Duration) error {
+func (f *fakeWA) MuteChat(ctx context.Context, target types.JID, mute bool, duration time.Duration, beforeApply func()) ([]interface{}, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.muteCalls = append(f.muteCalls, fakeMuteCall{target: target, mute: mute, duration: duration})
-	return nil
+	beforeApply()
+	return nil, nil
 }
 
-func (f *fakeWA) MarkChatAsRead(ctx context.Context, target types.JID, read bool, lastMsgTS time.Time, lastMsgKey *waCommon.MessageKey) error {
+func (f *fakeWA) MarkChatAsRead(ctx context.Context, target types.JID, read bool, lastMsgTS time.Time, lastMsgKey *waCommon.MessageKey, beforeApply func()) ([]interface{}, error) {
 	f.mu.Lock()
-	defer f.mu.Unlock()
 	f.markReadCalls = append(f.markReadCalls, fakeMarkReadCall{target: target, read: read, lastMsgTS: lastMsgTS, lastMsgKey: lastMsgKey})
-	return nil
+	hook := f.markReadBeforeApply
+	f.mu.Unlock()
+	if hook != nil {
+		hook()
+	}
+	beforeApply()
+	return nil, nil
 }
 
 func (f *fakeWA) FetchAppState(ctx context.Context, name string, fullSync, onlyIfNotSynced bool) error {
@@ -711,6 +788,10 @@ func (f *fakeWA) FetchAppState(ctx context.Context, name string, fullSync, onlyI
 		onlyIfNotSynced: onlyIfNotSynced,
 	})
 	err := f.appStateFetchErr
+	if len(f.appStateFetchErrs) > 0 {
+		err = f.appStateFetchErrs[0]
+		f.appStateFetchErrs = f.appStateFetchErrs[1:]
+	}
 	eventCB := f.appStateFetchEvent
 	f.mu.Unlock()
 	if err != nil {
@@ -722,6 +803,36 @@ func (f *fakeWA) FetchAppState(ctx context.Context, name string, fullSync, onlyI
 		}
 	}
 	return nil
+}
+
+func (f *fakeWA) FetchAppStateEvents(ctx context.Context, name string, fullSync, onlyIfNotSynced bool) ([]interface{}, error) {
+	f.mu.Lock()
+	f.appStateFetches = append(f.appStateFetches, fakeAppStateFetch{
+		name:            name,
+		fullSync:        fullSync,
+		onlyIfNotSynced: onlyIfNotSynced,
+	})
+	err := f.appStateFetchErr
+	if len(f.appStateFetchErrs) > 0 {
+		err = f.appStateFetchErrs[0]
+		f.appStateFetchErrs = f.appStateFetchErrs[1:]
+	}
+	eventCB := f.appStateFetchEvent
+	f.mu.Unlock()
+	if err != nil {
+		if !errors.Is(err, appstate.ErrKeyNotFound) {
+			f.emit(&events.AppStateSyncError{Name: appstate.WAPatchName(name), FullSync: fullSync, Error: err})
+		}
+		return nil, err
+	}
+	if eventCB == nil {
+		return nil, nil
+	}
+	evt := eventCB(name, fullSync, onlyIfNotSynced)
+	if evt == nil {
+		return nil, nil
+	}
+	return []interface{}{evt}, nil
 }
 
 func (f *fakeWA) Logout(ctx context.Context) error {

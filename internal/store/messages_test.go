@@ -1,6 +1,8 @@
 package store
 
 import (
+	"database/sql"
+	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -781,6 +783,51 @@ func TestCountMessagesAndOldestMessageInfo(t *testing.T) {
 	}
 }
 
+func TestGetNextMessageInfo(t *testing.T) {
+	db := openTestDB(t)
+	base := time.Date(2024, 2, 1, 0, 0, 0, 0, time.UTC)
+	for _, chat := range []string{"123@g.us", "456@g.us"} {
+		if err := db.UpsertChat(chat, "group", "Test group", base); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Insert out of timestamp order, with a tie and an interleaved different chat.
+	for _, msg := range []UpsertMessageParams{
+		{ChatJID: "123@g.us", MsgID: "latest", Timestamp: base.Add(time.Second)},
+		{ChatJID: "123@g.us", MsgID: "first", Timestamp: base},
+		{ChatJID: "456@g.us", MsgID: "other", Timestamp: base},
+		{ChatJID: "123@g.us", MsgID: "second", Timestamp: base, FromMe: true, SenderJID: "789@s.whatsapp.net", SenderName: "Alice"},
+	} {
+		if err := db.UpsertMessage(msg); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, tc := range []struct{ chat, anchor, want string }{
+		{"123@g.us", "first", "second"},
+		{"123@g.us", "second", "latest"},
+		{"123@g.us", "latest", ""},
+		{"123@g.us", "missing", ""},
+		{"456@g.us", "other", ""},
+		{"456@g.us", "first", ""},
+	} {
+		t.Run(tc.chat+"/"+tc.anchor, func(t *testing.T) {
+			next, err := db.GetNextMessageInfo(tc.chat, tc.anchor)
+			if tc.want == "" {
+				if !errors.Is(err, sql.ErrNoRows) {
+					t.Fatalf("error = %v, want no rows", err)
+				}
+				return
+			}
+			if err != nil || next.ChatJID != tc.chat || next.MsgID != tc.want {
+				t.Fatalf("next = %+v, err = %v, want %s", next, err, tc.want)
+			}
+			if tc.want == "second" && (!next.Timestamp.Equal(base) || !next.FromMe || next.SenderJID != "789@s.whatsapp.net" || next.SenderName != "Alice") {
+				t.Fatalf("next lost anchor metadata: %+v", next)
+			}
+		})
+	}
+}
+
 func TestMessageRevokedTombstoneIsHiddenFromListAndSearch(t *testing.T) {
 	db := openTestDB(t)
 
@@ -808,8 +855,11 @@ func TestMessageRevokedTombstoneIsHiddenFromListAndSearch(t *testing.T) {
 	if !deleted.Revoked {
 		t.Fatalf("deleted.Revoked = false")
 	}
-	if deleted.Text != "" || deleted.DisplayText != DeletedMessageDisplayText {
+	if deleted.Text != "secret needle" || deleted.DisplayText != "secret needle" {
 		t.Fatalf("deleted text=%q display=%q", deleted.Text, deleted.DisplayText)
+	}
+	if deleted.DeletedAt == nil || deleted.DeletionReason != MessageDeletionReasonWhatsAppRevoke {
+		t.Fatalf("deleted tombstone = %v %q", deleted.DeletedAt, deleted.DeletionReason)
 	}
 
 	msgs, err := db.ListMessages(ListMessagesParams{ChatJID: chat, Limit: 10})
@@ -861,8 +911,11 @@ func TestMessageDeletedForMeTombstoneIsHiddenFromListAndSearch(t *testing.T) {
 	if deleted.Revoked || !deleted.DeletedForMe {
 		t.Fatalf("deleted flags revoked=%v deleted_for_me=%v", deleted.Revoked, deleted.DeletedForMe)
 	}
-	if deleted.Text != "" || deleted.DisplayText != DeletedForMeMessageDisplayText {
+	if deleted.Text != "local secret needle" || deleted.DisplayText != "local secret needle" {
 		t.Fatalf("deleted text=%q display=%q", deleted.Text, deleted.DisplayText)
+	}
+	if deleted.DeletedAt == nil || !deleted.DeletedAt.Equal(now.Add(3*time.Second)) || deleted.DeletionReason != MessageDeletionReasonWhatsAppDeleteForMe {
+		t.Fatalf("deleted tombstone = %v %q", deleted.DeletedAt, deleted.DeletionReason)
 	}
 	if !deleted.Timestamp.Equal(now.Add(time.Second)) {
 		t.Fatalf("deleted timestamp = %s, want original message timestamp", deleted.Timestamp)
@@ -981,7 +1034,7 @@ func TestMessageButtonsListRowRoundTrip(t *testing.T) {
 	}
 }
 
-func TestMessageButtonsClearedOnRevoke(t *testing.T) {
+func TestMessageButtonsPreservedOnRevoke(t *testing.T) {
 	db := openTestDB(t)
 
 	chat := "biz@s.whatsapp.net"
@@ -1008,12 +1061,12 @@ func TestMessageButtonsClearedOnRevoke(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetMessage: %v", err)
 	}
-	if len(msg.Buttons) != 0 {
-		t.Fatalf("expected buttons cleared after revoke, got %+v", msg.Buttons)
+	if len(msg.Buttons) != 1 || msg.Buttons[0].URL != "https://example.com" {
+		t.Fatalf("expected buttons retained after revoke, got %+v", msg.Buttons)
 	}
 }
 
-func TestMessageButtonsClearedOnDeletedForMe(t *testing.T) {
+func TestMessageButtonsPreservedOnDeletedForMe(t *testing.T) {
 	db := openTestDB(t)
 
 	chat := "biz@s.whatsapp.net"
@@ -1040,8 +1093,8 @@ func TestMessageButtonsClearedOnDeletedForMe(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetMessage: %v", err)
 	}
-	if len(msg.Buttons) != 0 {
-		t.Fatalf("expected buttons cleared after deleted-for-me, got %+v", msg.Buttons)
+	if len(msg.Buttons) != 1 || msg.Buttons[0].ID != "yes" {
+		t.Fatalf("expected buttons retained after deleted-for-me, got %+v", msg.Buttons)
 	}
 }
 
@@ -1082,8 +1135,180 @@ func TestMarkMessageDeletedForMePreserveMediaKeepsLocalPath(t *testing.T) {
 	if msg.LocalPath != "/tmp/media.jpg" || msg.DownloadedAt.IsZero() {
 		t.Fatalf("media metadata was not preserved: path=%q downloaded_at=%v", msg.LocalPath, msg.DownloadedAt)
 	}
-	if len(msg.Buttons) != 0 {
-		t.Fatalf("expected buttons cleared after deleted-for-me, got %+v", msg.Buttons)
+	if len(msg.Buttons) != 1 || msg.Buttons[0].ID != "yes" {
+		t.Fatalf("expected buttons retained after deleted-for-me, got %+v", msg.Buttons)
+	}
+}
+
+func TestMessageStoreImportsMergeWithoutDeletingUnseenRows(t *testing.T) {
+	db := openTestDB(t)
+	chat := "chat@s.whatsapp.net"
+	now := time.Date(2024, 1, 1, 12, 0, 0, 0, time.UTC)
+	if err := db.UpsertChat(chat, "dm", "Alice", now); err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range []string{"seen-again", "not-seen"} {
+		if err := db.UpsertMessage(UpsertMessageParams{ChatJID: chat, MsgID: id, Timestamp: now, Text: id}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := db.UpsertMessage(UpsertMessageParams{ChatJID: chat, MsgID: "seen-again", Timestamp: now.Add(time.Minute), Text: "updated"}); err != nil {
+		t.Fatal(err)
+	}
+	unseen, err := db.GetMessage(chat, "not-seen")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if unseen.DeletedAt != nil || unseen.Text != "not-seen" {
+		t.Fatalf("unseen merge row = %+v", unseen)
+	}
+	msgs, err := db.ListMessages(ListMessagesParams{ChatJID: chat, Limit: 10})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(msgs) != 2 {
+		t.Fatalf("merge removed unseen row: %+v", msgs)
+	}
+}
+
+func TestTombstoneFirstImportRetainsLaterHistoryPayload(t *testing.T) {
+	db := openTestDB(t)
+	chat := "chat@s.whatsapp.net"
+	messageAt := time.Date(2024, 1, 1, 12, 0, 0, 0, time.UTC)
+	deletedAt := messageAt.Add(time.Hour)
+	if err := db.UpsertChat(chat, "dm", "Alice", messageAt); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.UpsertMessage(UpsertMessageParams{ChatJID: chat, MsgID: "mid", Timestamp: deletedAt, Revoked: true}); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.UpsertMessage(UpsertMessageParams{
+		ChatJID: chat, MsgID: "mid", SenderJID: chat, SenderName: "Alice", Timestamp: messageAt,
+		FromMe: true, Text: "history payload", DisplayText: "history display",
+		IsForwarded: true, ForwardingScore: 2, ReactionToID: "target", ReactionEmoji: "👍",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	msg, err := db.GetMessage(chat, "mid")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !msg.Revoked || msg.DeletedAt == nil || !msg.DeletedAt.Equal(deletedAt) {
+		t.Fatalf("tombstone state = %+v", msg)
+	}
+	if !msg.Timestamp.Equal(messageAt) || !msg.FromMe || msg.Text != "history payload" || msg.DisplayText != "history display" {
+		t.Fatalf("history payload was not retained: %+v", msg)
+	}
+	if !msg.IsForwarded || msg.ForwardingScore != 2 || msg.ReactionToID != "target" || msg.ReactionEmoji != "👍" {
+		t.Fatalf("history metadata was not retained: %+v", msg)
+	}
+}
+
+func TestPurgeMessageRequiresTombstoneAndKeepsSuppressionMarker(t *testing.T) {
+	db := openTestDB(t)
+	chat := "chat@s.whatsapp.net"
+	now := time.Date(2024, 1, 1, 12, 0, 0, 0, time.UTC)
+	if err := db.UpsertChat(chat, "dm", "Alice", now); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.UpsertMessage(UpsertMessageParams{
+		ChatJID: chat, MsgID: "mid", Timestamp: now, Text: "retained",
+		MediaType: "document", Filename: "proof.pdf",
+		Buttons: []Button{{Type: "quick_reply", DisplayText: "Keep", ID: "keep"}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.PurgeMessage(chat, "mid"); !errors.Is(err, ErrMessageNotTombstoned) {
+		t.Fatalf("live purge error = %v", err)
+	}
+	if err := db.MarkMessageRevoked(chat, "mid"); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.PurgeMessage(chat, "mid"); err != nil {
+		t.Fatal(err)
+	}
+	purged, err := db.GetMessage(chat, "mid")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if purged.PayloadPurgedAt == nil || purged.DeletedAt == nil || !purged.Revoked {
+		t.Fatalf("purged tombstone metadata = %+v", purged)
+	}
+	if purged.Text != "" || purged.MediaType != "" || purged.Filename != "" || len(purged.Buttons) != 0 {
+		t.Fatalf("purged payload retained data: %+v", purged)
+	}
+	if err := db.UpsertMessage(UpsertMessageParams{
+		ChatJID: chat, MsgID: "mid", Timestamp: now.Add(time.Hour), Text: "restored by history",
+		MediaType: "document", Filename: "restored.pdf",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	purged, err = db.GetMessage(chat, "mid")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if purged.Text != "" || purged.Filename != "" || purged.PayloadPurgedAt == nil {
+		t.Fatalf("history import restored purged payload: %+v", purged)
+	}
+	if _, err := db.sql.Exec(`DELETE FROM chats WHERE jid = ?`, chat); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.UpsertChat(chat, "dm", "Alice", now.Add(2*time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.UpsertMessage(UpsertMessageParams{ChatJID: chat, MsgID: "mid", Timestamp: now.Add(2 * time.Hour), Text: "restored after cleanup"}); err != nil {
+		t.Fatal(err)
+	}
+	var messageCount, purgeCount int
+	if err := db.sql.QueryRow(`SELECT count(*) FROM messages WHERE chat_jid = ? AND msg_id = ?`, chat, "mid").Scan(&messageCount); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.sql.QueryRow(`SELECT count(*) FROM message_payload_purges WHERE chat_jid = ? AND msg_id = ?`, chat, "mid").Scan(&purgeCount); err != nil {
+		t.Fatal(err)
+	}
+	if messageCount != 0 || purgeCount != 1 {
+		t.Fatalf("post-cleanup suppression counts: messages=%d purges=%d", messageCount, purgeCount)
+	}
+}
+
+func TestPurgeMessageClearsAllLocalMediaAliases(t *testing.T) {
+	db := openTestDB(t)
+	chat := "chat@s.whatsapp.net"
+	now := time.Date(2024, 1, 1, 12, 0, 0, 0, time.UTC)
+	if err := db.UpsertChat(chat, "dm", "Alice", now); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.UpsertMessage(UpsertMessageParams{ChatJID: chat, MsgID: "mid", Timestamp: now, Text: "retained"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.MarkMediaDownloaded(chat, "mid", "/tmp/main-media", now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.sql.Exec(`
+		INSERT INTO message_local_media_aliases(chat_jid, msg_id, local_path, downloaded_at)
+		VALUES(?, ?, ?, ?)
+	`, chat, "mid", "/tmp/alias-media", now.Unix()); err != nil {
+		t.Fatal(err)
+	}
+	paths, err := db.MessageLocalMediaPaths(chat, "mid")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(paths) != 2 {
+		t.Fatalf("media paths before purge = %#v", paths)
+	}
+	if err := db.MarkMessageRevoked(chat, "mid"); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.PurgeMessage(chat, "mid"); err != nil {
+		t.Fatal(err)
+	}
+	paths, err = db.MessageLocalMediaPaths(chat, "mid")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(paths) != 0 {
+		t.Fatalf("media paths after purge = %#v", paths)
 	}
 }
 
@@ -1172,5 +1397,34 @@ func TestUpdateMessageTextClearsMediaState(t *testing.T) {
 	}
 	if msg.MediaType != "" || msg.MediaCaption != "" || msg.Filename != "" {
 		t.Fatalf("media state not cleared: %+v", msg)
+	}
+}
+
+func TestPurgeMessageClearsStoredLocation(t *testing.T) {
+	db := openTestDB(t)
+	chat := "chat@s.whatsapp.net"
+	now := time.Date(2024, 1, 1, 12, 0, 0, 0, time.UTC)
+	if err := db.UpsertChat(chat, "dm", "Alice", now); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.UpsertMessage(UpsertMessageParams{
+		ChatJID: chat, MsgID: "mid", Timestamp: now, MediaType: "location",
+		DisplayText: "Sent location",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.UpsertMessageLocation(MessageLocation{
+		ChatJID: chat, MsgID: "mid", Latitude: 51.4779, Longitude: -0.0015, Name: "Head office",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.MarkMessageRevoked(chat, "mid"); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.PurgeMessage(chat, "mid"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.GetMessageLocation(chat, "mid"); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("purged message retained its coordinates: err = %v", err)
 	}
 }

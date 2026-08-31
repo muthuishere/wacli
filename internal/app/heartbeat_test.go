@@ -28,9 +28,12 @@ func TestSyncWritesHeartbeatFileOnActivity(t *testing.T) {
 		&messagesStored,
 		&lastEvent,
 		make(chan struct{}, 1),
+		make(chan struct{}, 1),
 		make(chan staleReconnectRequest, 1),
 		func(string, string) {},
 		nil,
+		nil,
+		&syncPresence{},
 		nil,
 	)
 	defer f.RemoveEventHandler(handlerID)
@@ -64,9 +67,12 @@ func TestSyncOnceDoesNotWriteHeartbeatFile(t *testing.T) {
 		&messagesStored,
 		&lastEvent,
 		make(chan struct{}, 1),
+		make(chan struct{}, 1),
 		make(chan staleReconnectRequest, 1),
 		func(string, string) {},
 		nil,
+		nil,
+		&syncPresence{},
 		nil,
 	)
 	defer f.RemoveEventHandler(handlerID)
@@ -92,9 +98,12 @@ func TestSyncFollowDoesNotWriteHeartbeatOnKeepAliveTimeout(t *testing.T) {
 		&messagesStored,
 		&lastEvent,
 		make(chan struct{}, 1),
+		make(chan struct{}, 1),
 		make(chan staleReconnectRequest, 1),
 		func(string, string) {},
 		nil,
+		nil,
+		&syncPresence{},
 		nil,
 	)
 	defer f.RemoveEventHandler(handlerID)
@@ -185,6 +194,7 @@ func TestSyncFollowDoesNotReconnectOnFreshKeepAliveTimeout(t *testing.T) {
 	var messagesStored atomic.Int64
 	var lastEvent atomic.Int64
 	disconnected := make(chan struct{}, 1)
+	loggedOut := make(chan struct{}, 1)
 	staleReconnect := make(chan staleReconnectRequest, 1)
 	handlerID := a.addSyncEventHandler(
 		context.Background(),
@@ -192,9 +202,12 @@ func TestSyncFollowDoesNotReconnectOnFreshKeepAliveTimeout(t *testing.T) {
 		&messagesStored,
 		&lastEvent,
 		disconnected,
+		loggedOut,
 		staleReconnect,
 		func(string, string) {},
 		nil,
+		nil,
+		&syncPresence{},
 		nil,
 	)
 	defer f.RemoveEventHandler(handlerID)
@@ -235,6 +248,7 @@ func TestSyncFollowEmitsStaleEvent(t *testing.T) {
 	var lastEvent atomic.Int64
 	var connectionEpoch atomic.Int64
 	disconnected := make(chan struct{}, 1)
+	loggedOut := make(chan struct{}, 1)
 	staleReconnect := make(chan staleReconnectRequest, 1)
 	handlerID := a.addSyncEventHandler(
 		context.Background(),
@@ -242,9 +256,12 @@ func TestSyncFollowEmitsStaleEvent(t *testing.T) {
 		&messagesStored,
 		&lastEvent,
 		disconnected,
+		loggedOut,
 		staleReconnect,
 		func(string, string) {},
 		nil,
+		nil,
+		&syncPresence{},
 		nil,
 	)
 	defer f.RemoveEventHandler(handlerID)
@@ -253,7 +270,7 @@ func TestSyncFollowEmitsStaleEvent(t *testing.T) {
 	defer cancel()
 	done := make(chan error, 1)
 	go func() {
-		_, err := a.runSyncFollow(ctx, time.Second, &messagesStored, &connectionEpoch, disconnected, staleReconnect)
+		_, err := a.runSyncFollow(ctx, time.Second, SyncPresenceModeNormal, &messagesStored, &connectionEpoch, disconnected, loggedOut, staleReconnect)
 		done <- err
 	}()
 

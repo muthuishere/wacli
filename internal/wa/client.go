@@ -110,6 +110,17 @@ type ConnectOptions struct {
 	OnQRCode        func(code string)
 	PairPhoneNumber string
 	OnPairCode      func(code string)
+	// SuppressInitialAvailablePresence skips the post-connect available
+	// presence update for callers that need a quiet linked-device session.
+	// The default false preserves normal WhatsApp linked-device behavior.
+	SuppressInitialAvailablePresence bool
+	// DetachSocket, when true, connects the websocket with a detached
+	// context so it is not closed when the caller's context is cancelled.
+	// This allows graceful shutdown to send a final PresenceUnavailable
+	// stanza before the client is disconnected. Only sync uses this;
+	// other commands keep the default (false) so --timeout and signal
+	// cancellation still bound the connection.
+	DetachSocket bool
 }
 
 func (c *Client) Connect(ctx context.Context, opts ConnectOptions) error {
@@ -138,11 +149,50 @@ func (c *Client) Connect(ctx context.Context, opts ConnectOptions) error {
 		qrChan = ch
 	}
 
-	if err := cli.ConnectContext(ctx); err != nil {
+	// When DetachSocket is set (sync), connect with a detached context that
+	// has a 30-second dial timeout. The dial is bounded so a hanging connect
+	// cannot outlive SIGTERM indefinitely; after the dial succeeds the timer
+	// is stopped so the websocket stays open until Disconnect()/Close().
+	// Other commands keep the caller's context so --timeout and signal
+	// cancellation still bound the connection.
+	connCtx := ctx
+	var dialCancel context.CancelFunc
+	var dialTimer *time.Timer
+	var dialStop func() bool
+	if opts.DetachSocket {
+		// Use a detached context so the websocket survives signal
+		// cancellation, but also cancel the dial if the caller's
+		// context fires (--max-reconnect, SIGTERM) so an in-flight
+		// connect cannot outlive caller cancellation.
+		connCtx, dialCancel = context.WithCancel(context.Background())
+		dialTimer = time.AfterFunc(30*time.Second, dialCancel)
+		dialStop = context.AfterFunc(ctx, dialCancel)
+	}
+	if err := cli.ConnectContext(connCtx); err != nil {
+		if dialCancel != nil {
+			dialCancel()
+		}
+		if dialTimer != nil {
+			dialTimer.Stop()
+		}
+		if dialStop != nil {
+			dialStop()
+		}
 		return err
+	}
+	// Dial succeeded — stop the timer and unregister the caller
+	// cancellation hook so the websocket stays alive until Close().
+	if dialTimer != nil {
+		dialTimer.Stop()
+	}
+	if dialStop != nil {
+		dialStop()
 	}
 
 	if authed {
+		if opts.SuppressInitialAvailablePresence {
+			return nil
+		}
 		sendInitialAvailablePresence(ctx, cli)
 		return nil
 	}
@@ -197,13 +247,17 @@ func qrChannelEventError(evt whatsmeow.QRChannelItem) error {
 		return fmt.Errorf("QR scanned, but multi-device is not enabled on the phone")
 	case evt == whatsmeow.QRChannelErrUnexpectedEvent:
 		return fmt.Errorf("unexpected QR pairing state; run `wacli auth` again")
+	case evt.Event == whatsmeow.QRChannelEventPasskeyRequest:
+		return fmt.Errorf("WhatsApp requires passkey verification, which wacli cannot safely complete yet; preserve any existing authenticated store and check for an updated wacli release")
+	case evt.Event == whatsmeow.QRChannelEventPasskeyResponse:
+		return fmt.Errorf("WhatsApp requires passkey confirmation, which wacli cannot safely complete yet; preserve any existing authenticated store and check for an updated wacli release")
 	case evt.Event == whatsmeow.QRChannelEventError:
 		if evt.Error != nil {
 			return fmt.Errorf("QR pairing failed: %w", evt.Error)
 		}
 		return fmt.Errorf("QR pairing failed")
 	default:
-		return nil
+		return fmt.Errorf("unsupported QR pairing state %q; update wacli and try again", evt.Event)
 	}
 }
 
@@ -659,6 +713,26 @@ func (c *Client) FetchAppState(ctx context.Context, name string, fullSync, onlyI
 	return cli.FetchAppState(ctx, appstate.WAPatchName(name), fullSync, onlyIfNotSynced)
 }
 
+// FetchAppStateEvents fetches one collection without globally dispatching the
+// resulting events, so callers can persist that exact collection atomically
+// with their own recovery marker protocol.
+func (c *Client) FetchAppStateEvents(ctx context.Context, name string, fullSync, onlyIfNotSynced bool) ([]interface{}, error) {
+	c.mu.Lock()
+	cli := c.client
+	c.mu.Unlock()
+	if cli == nil || !cli.IsConnected() {
+		return nil, fmt.Errorf("not connected")
+	}
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return nil, fmt.Errorf("app state collection name is required")
+	}
+	if fullSync && !cli.EmitAppStateEventsOnFullSync {
+		return nil, fmt.Errorf("full app state replay mutation emission is disabled")
+	}
+	return cli.DangerousInternals().FetchAppState(ctx, appstate.WAPatchName(name), fullSync, onlyIfNotSynced)
+}
+
 func (c *Client) GetUserInfo(ctx context.Context, jids []types.JID) (map[types.JID]types.UserInfo, error) {
 	c.mu.Lock()
 	cli := c.client
@@ -811,6 +885,17 @@ func sendInitialAvailablePresence(ctx context.Context, cli *whatsmeow.Client) {
 	}
 }
 
+// SendPresence updates the authenticated account's global presence status.
+func (c *Client) SendPresence(ctx context.Context, presence types.Presence) error {
+	c.mu.Lock()
+	cli := c.client
+	c.mu.Unlock()
+	if cli == nil || !cli.IsConnected() {
+		return fmt.Errorf("not connected")
+	}
+	return cli.SendPresence(ctx, presence)
+}
+
 func (c *Client) Logout(ctx context.Context) error {
 	c.mu.Lock()
 	cli := c.client
@@ -884,7 +969,7 @@ func (c *Client) SetStatusMessage(ctx context.Context, msg string) error {
 	if cli == nil || !cli.IsConnected() {
 		return fmt.Errorf("not connected")
 	}
-	return cli.SetStatusMessage(ctx, msg)
+	return cli.SetStatusMessage(ctx, types.SetStatusInput{Text: &msg})
 }
 
 func (c *Client) SetProfileName(ctx context.Context, name string) error {
@@ -914,13 +999,15 @@ func (c *Client) GetBusinessProfile(ctx context.Context, jid types.JID) (*types.
 }
 
 // Reconnect loop helper.
-func (c *Client) ReconnectWithBackoff(ctx context.Context, minDelay, maxDelay time.Duration) error {
+func (c *Client) ReconnectWithBackoff(ctx context.Context, minDelay, maxDelay time.Duration, opts ConnectOptions) error {
+	opts.AllowQR = false
+	opts.DetachSocket = true
 	delay := minDelay
 	for {
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
-		if err := c.Connect(ctx, ConnectOptions{AllowQR: false}); err == nil {
+		if err := c.Connect(ctx, opts); err == nil {
 			return nil
 		}
 		select {

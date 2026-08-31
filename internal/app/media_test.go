@@ -9,6 +9,39 @@ import (
 	"github.com/openclaw/wacli/internal/store"
 )
 
+func TestMediaQueueWaitIdleFencesActiveProducer(t *testing.T) {
+	queue := newMediaQueue(1)
+	if !queue.beginProducer() {
+		t.Fatal("expected producer admission before drain")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	drained := make(chan bool, 1)
+	go func() {
+		drained <- queue.waitIdle(ctx)
+	}()
+
+	select {
+	case <-drained:
+		t.Fatal("queue reported idle while an event producer was active")
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	queue.endProducer()
+	select {
+	case ok := <-drained:
+		if !ok {
+			t.Fatal("queue drain was canceled")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("queue did not drain after producer finished")
+	}
+	if queue.beginProducer() {
+		t.Fatal("queue admitted a producer after the drain fence")
+	}
+}
+
 func TestDownloadMediaJobMarksDownloaded(t *testing.T) {
 	a := newTestApp(t)
 	f := newFakeWA()
@@ -39,8 +72,12 @@ func TestDownloadMediaJobMarksDownloaded(t *testing.T) {
 		t.Fatalf("UpsertMessage: %v", err)
 	}
 
-	if err := a.downloadMediaJob(context.Background(), mediaJob{chatJID: chat, msgID: "mid"}); err != nil {
+	downloaded, err := a.downloadMediaJob(context.Background(), mediaJob{chatJID: chat, msgID: "mid"})
+	if err != nil {
 		t.Fatalf("downloadMediaJob: %v", err)
+	}
+	if !downloaded {
+		t.Fatalf("expected downloaded=true")
 	}
 
 	info, err := a.db.GetMediaDownloadInfo(chat, "mid")

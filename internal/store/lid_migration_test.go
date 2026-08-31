@@ -1,6 +1,8 @@
 package store
 
 import (
+	"database/sql"
+	"errors"
 	"reflect"
 	"testing"
 	"time"
@@ -62,6 +64,48 @@ func TestHistoricalLIDJIDsFindsChatAndMessageColumns(t *testing.T) {
 	got, err := db.HistoricalLIDJIDs()
 	if err != nil {
 		t.Fatalf("HistoricalLIDJIDs: %v", err)
+	}
+	if want := []string{lid}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("HistoricalLIDJIDs = %#v, want %#v", got, want)
+	}
+}
+
+func TestHistoricalLIDJIDsFindsGroupIdentities(t *testing.T) {
+	db := openTestDB(t)
+	lid := "999123456789@lid"
+	group := "120363000000@g.us"
+	if err := db.UpsertGroup(group, "Project", lid, time.Time{}); err != nil {
+		t.Fatalf("UpsertGroup: %v", err)
+	}
+	if err := db.ReplaceGroupParticipants(group, []GroupParticipant{{
+		GroupJID: group,
+		UserJID:  lid,
+		Role:     "admin",
+	}}); err != nil {
+		t.Fatalf("ReplaceGroupParticipants: %v", err)
+	}
+
+	got, err := db.HistoricalLIDJIDs()
+	if err != nil {
+		t.Fatalf("HistoricalLIDJIDs: %v", err)
+	}
+	if want := []string{lid}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("HistoricalLIDJIDs = %#v, want %#v", got, want)
+	}
+}
+
+func TestHistoricalLIDJIDsFindsPurgeLedgerOnlyIdentity(t *testing.T) {
+	db := openTestDB(t)
+	lid := "888123456789@lid"
+	if _, err := db.sql.Exec(`
+		INSERT INTO message_payload_purges(chat_jid, msg_id, purged_at, deleted_at, deletion_reason)
+		VALUES(?, 'mid', 3, 2, 'whatsapp-revoke')
+	`, lid); err != nil {
+		t.Fatal(err)
+	}
+	got, err := db.HistoricalLIDJIDs()
+	if err != nil {
+		t.Fatal(err)
 	}
 	if want := []string{lid}; !reflect.DeepEqual(got, want) {
 		t.Fatalf("HistoricalLIDJIDs = %#v, want %#v", got, want)
@@ -297,6 +341,52 @@ func TestMigrateLIDToPNMergesChatsAndMessages(t *testing.T) {
 	}
 }
 
+func TestMigrateLIDToPNMergesGroupIdentities(t *testing.T) {
+	db := openTestDB(t)
+	lid := "999123456789@lid"
+	pn := "15551234567@s.whatsapp.net"
+	group := "120363000000@g.us"
+	if err := db.UpsertGroup(group, "Project", lid, time.Time{}); err != nil {
+		t.Fatalf("UpsertGroup: %v", err)
+	}
+	if _, err := db.sql.Exec(`
+		INSERT INTO group_participants(group_jid, user_jid, role, updated_at)
+		VALUES (?, ?, 'member', 1), (?, ?, 'admin', 2)
+	`, group, pn, group, lid); err != nil {
+		t.Fatalf("insert participants: %v", err)
+	}
+
+	if err := db.MigrateLIDToPN(lid, pn); err != nil {
+		t.Fatalf("MigrateLIDToPN: %v", err)
+	}
+	if err := db.MigrateLIDToPN(lid, pn); err != nil {
+		t.Fatalf("MigrateLIDToPN idempotent: %v", err)
+	}
+
+	groups, err := db.ListGroups("Project", 1)
+	if err != nil {
+		t.Fatalf("ListGroups: %v", err)
+	}
+	if len(groups) != 1 || groups[0].OwnerJID != pn {
+		t.Fatalf("groups = %+v, want owner %q", groups, pn)
+	}
+	if got := countRows(t, db.sql, "SELECT COUNT(*) FROM group_participants WHERE group_jid = ?", group); got != 1 {
+		t.Fatalf("participant rows = %d, want 1", got)
+	}
+	var userJID, role string
+	var updatedAt int64
+	if err := db.sql.QueryRow(`
+		SELECT user_jid, role, updated_at
+		FROM group_participants
+		WHERE group_jid = ?
+	`, group).Scan(&userJID, &role, &updatedAt); err != nil {
+		t.Fatalf("query participant: %v", err)
+	}
+	if userJID != pn || role != "admin" || updatedAt != 2 {
+		t.Fatalf("participant = (%q, %q, %d), want (%q, admin, 2)", userJID, role, updatedAt, pn)
+	}
+}
+
 func TestMigrateLIDToPNPreservesButtons(t *testing.T) {
 	db := openTestDB(t)
 	base := time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC)
@@ -341,7 +431,7 @@ func TestMigrateLIDToPNPreservesButtons(t *testing.T) {
 	}
 }
 
-func TestMigrateLIDToPNClearsQuotedMetadataOnDeletedMessages(t *testing.T) {
+func TestMigrateLIDToPNPreservesDeletedMessagePayload(t *testing.T) {
 	db := openTestDB(t)
 	base := time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC)
 
@@ -357,6 +447,9 @@ func TestMigrateLIDToPNClearsQuotedMetadataOnDeletedMessages(t *testing.T) {
 		Timestamp:       base,
 		QuotedMsgID:     "quoted",
 		QuotedSenderJID: lid,
+		Text:            "retained reply",
+		MediaType:       "document",
+		Filename:        "proof.pdf",
 		DeletedForMe:    true,
 	}); err != nil {
 		t.Fatalf("UpsertMessage: %v", err)
@@ -376,8 +469,90 @@ func TestMigrateLIDToPNClearsQuotedMetadataOnDeletedMessages(t *testing.T) {
 	if !msg.DeletedForMe {
 		t.Fatalf("DeletedForMe = false")
 	}
-	if msg.QuotedMsgID != "" || msg.QuotedSenderJID != "" {
+	if msg.QuotedMsgID != "quoted" || msg.QuotedSenderJID != pn {
 		t.Fatalf("deleted quoted metadata = id %q sender %q", msg.QuotedMsgID, msg.QuotedSenderJID)
+	}
+	if msg.Text != "retained reply" || msg.MediaType != "document" || msg.Filename != "proof.pdf" {
+		t.Fatalf("deleted payload = %+v", msg)
+	}
+	if msg.DeletedAt == nil || msg.DeletionReason != MessageDeletionReasonWhatsAppDeleteForMe {
+		t.Fatalf("deleted tombstone = %v %q", msg.DeletedAt, msg.DeletionReason)
+	}
+}
+
+func TestMigrateLIDToPNPreservesPayloadPurgeSuppression(t *testing.T) {
+	db := openTestDB(t)
+	base := time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC)
+	pn := "15551234567@s.whatsapp.net"
+	lid := "999123456789@lid"
+	for _, chat := range []string{pn, lid} {
+		if err := db.UpsertChat(chat, "dm", "Alice", base); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, id := range []string{"purged-lid", "purged-pn", "ledger-lid", "ledger-pn"} {
+		if err := db.UpsertMessage(UpsertMessageParams{ChatJID: pn, MsgID: id, Timestamp: base, Text: "pn payload"}); err != nil {
+			t.Fatal(err)
+		}
+		if err := db.UpsertMessage(UpsertMessageParams{ChatJID: lid, MsgID: id, Timestamp: base, Text: "lid payload"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := db.MarkMessageRevoked(lid, "purged-lid"); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.PurgeMessage(lid, "purged-lid"); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.MarkMessageRevoked(pn, "purged-pn"); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.PurgeMessage(pn, "purged-pn"); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.MarkMessageRevoked(lid, "ledger-lid"); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.PurgeMessage(lid, "ledger-lid"); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.MarkMessageRevoked(pn, "ledger-pn"); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.PurgeMessage(pn, "ledger-pn"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.sql.Exec(`DELETE FROM messages WHERE (chat_jid = ? AND msg_id = ?) OR (chat_jid = ? AND msg_id = ?)`, lid, "ledger-lid", pn, "ledger-pn"); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.UpsertPoll(Poll{ChatJID: pn, MsgID: "ledger-lid", Question: "destination-only secret", Options: []string{"secret"}, CreatedAt: base}); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := db.MigrateLIDToPN(lid, pn); err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range []string{"purged-lid", "purged-pn", "ledger-lid"} {
+		msg, err := db.GetMessage(pn, id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if msg.PayloadPurgedAt == nil || msg.Text != "" {
+			t.Fatalf("%s purge suppression after LID migration = %+v", id, msg)
+		}
+	}
+	var messageCount, purgeCount int
+	if err := db.sql.QueryRow(`SELECT count(*) FROM messages WHERE chat_jid = ? AND msg_id = ?`, pn, "ledger-pn").Scan(&messageCount); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.sql.QueryRow(`SELECT count(*) FROM message_payload_purges WHERE chat_jid = ? AND msg_id = ?`, pn, "ledger-pn").Scan(&purgeCount); err != nil {
+		t.Fatal(err)
+	}
+	if messageCount != 0 || purgeCount != 1 {
+		t.Fatalf("destination-ledger suppression counts: messages=%d purges=%d", messageCount, purgeCount)
+	}
+	if got := countRows(t, db.sql, `SELECT count(*) FROM polls WHERE msg_id = 'ledger-lid'`); got != 0 {
+		t.Fatalf("destination-only purged poll rows = %d", got)
 	}
 }
 
@@ -453,5 +628,81 @@ func TestMigrateLIDToPNPreservesEditedState(t *testing.T) {
 	}
 	if msg.Text != "edited" {
 		t.Fatalf("original upsert clobbered migrated edit: %q", msg.Text)
+	}
+}
+
+func TestMigrateLIDToPNMovesMessageLocations(t *testing.T) {
+	db := openTestDB(t)
+	base := time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC)
+
+	pn := "15551234567@s.whatsapp.net"
+	lid := "999123456789@lid"
+	if err := db.UpsertChat(lid, "unknown", lid, base); err != nil {
+		t.Fatalf("UpsertChat lid: %v", err)
+	}
+	if err := db.UpsertMessage(UpsertMessageParams{
+		ChatJID: lid, MsgID: "LOC-1", Timestamp: base, MediaType: "location",
+		DisplayText: "Sent location",
+	}); err != nil {
+		t.Fatalf("UpsertMessage: %v", err)
+	}
+	if err := db.UpsertMessageLocation(MessageLocation{
+		ChatJID: lid, MsgID: "LOC-1", Latitude: 51.4779, Longitude: -0.0015, Name: "Head office",
+	}); err != nil {
+		t.Fatalf("UpsertMessageLocation: %v", err)
+	}
+
+	if err := db.MigrateLIDToPN(lid, pn); err != nil {
+		t.Fatalf("MigrateLIDToPN: %v", err)
+	}
+
+	moved, err := db.GetMessageLocation(pn, "LOC-1")
+	if err != nil {
+		t.Fatalf("GetMessageLocation pn: %v", err)
+	}
+	if moved.Latitude != 51.4779 || moved.Longitude != -0.0015 {
+		t.Fatalf("coordinates = %v,%v", moved.Latitude, moved.Longitude)
+	}
+	if moved.Name != "Head office" {
+		t.Fatalf("name = %q", moved.Name)
+	}
+	if _, err := db.GetMessageLocation(lid, "LOC-1"); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("lid location retained: err = %v", err)
+	}
+}
+
+func TestMigrateLIDToPNDropsPurgedMessageLocations(t *testing.T) {
+	db := openTestDB(t)
+	base := time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC)
+
+	pn := "15551234567@s.whatsapp.net"
+	lid := "999123456789@lid"
+	if err := db.UpsertChat(lid, "unknown", lid, base); err != nil {
+		t.Fatalf("UpsertChat lid: %v", err)
+	}
+	if err := db.UpsertMessage(UpsertMessageParams{
+		ChatJID: lid, MsgID: "LOC-1", Timestamp: base, MediaType: "location",
+		DisplayText: "Sent location",
+	}); err != nil {
+		t.Fatalf("UpsertMessage: %v", err)
+	}
+	if err := db.UpsertMessageLocation(MessageLocation{
+		ChatJID: lid, MsgID: "LOC-1", Latitude: 51.4779, Longitude: -0.0015,
+	}); err != nil {
+		t.Fatalf("UpsertMessageLocation: %v", err)
+	}
+	if err := db.MarkMessageRevoked(lid, "LOC-1"); err != nil {
+		t.Fatalf("MarkMessageRevoked: %v", err)
+	}
+	if err := db.PurgeMessage(lid, "LOC-1"); err != nil {
+		t.Fatalf("PurgeMessage: %v", err)
+	}
+
+	if err := db.MigrateLIDToPN(lid, pn); err != nil {
+		t.Fatalf("MigrateLIDToPN: %v", err)
+	}
+
+	if _, err := db.GetMessageLocation(pn, "LOC-1"); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("purged coordinates resurfaced under the phone identity: err = %v", err)
 	}
 }

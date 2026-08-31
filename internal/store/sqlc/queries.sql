@@ -6,6 +6,13 @@ ON CONFLICT(jid) DO UPDATE SET
     name=CASE WHEN excluded.name IS NOT NULL AND excluded.name != '' THEN excluded.name ELSE chats.name END,
     last_message_ts=CASE WHEN excluded.last_message_ts > COALESCE(chats.last_message_ts, 0) THEN excluded.last_message_ts ELSE chats.last_message_ts END;
 
+-- name: UpsertChatMetadata :exec
+INSERT INTO chats(jid, kind, name)
+VALUES(?, ?, ?)
+ON CONFLICT(jid) DO UPDATE SET
+    kind=excluded.kind,
+    name=CASE WHEN excluded.name IS NOT NULL AND excluded.name != '' THEN excluded.name ELSE chats.name END;
+
 -- name: GetChat :one
 SELECT jid, kind, COALESCE(name,''), COALESCE(last_message_ts,0), COALESCE(archived,0), COALESCE(pinned,0), COALESCE(muted_until,0), COALESCE(unread,0), COALESCE(unread_count,0)
 FROM chats
@@ -173,66 +180,60 @@ INSERT INTO messages(
     quoted_msg_id, quoted_sender_jid,
     is_forwarded, forwarding_score, reaction_to_id, reaction_emoji,
     media_type, media_caption, filename, mime_type, direct_path,
-    media_key, file_sha256, file_enc_sha256, file_length, revoked, deleted_for_me, edited, edited_ts, buttons
-) VALUES (
+    media_key, file_sha256, file_enc_sha256, file_length, revoked, deleted_for_me,
+    deleted_at, deletion_reason, edited, edited_ts, buttons
+) SELECT
     ?, ?, ?, ?, ?,
     ?, ?, ?, ?,
     ?, ?,
     ?, ?, ?, ?,
     ?, ?, ?, ?, ?,
     ?, ?, ?, ?,
-    ?, ?, ?, ?, ?
+    ?, ?, ?, ?,
+    ?, ?, ?
+WHERE NOT EXISTS (
+    SELECT 1 FROM message_payload_purges p WHERE p.chat_jid = ? AND p.msg_id = ?
 )
 ON CONFLICT(chat_jid, msg_id) DO UPDATE SET
     chat_name=COALESCE(NULLIF(excluded.chat_name,''), messages.chat_name),
-    sender_jid=CASE WHEN ((messages.edited != 0 AND excluded.edited = 0) OR (messages.edited != 0 AND excluded.edited != 0 AND excluded.edited_ts < messages.edited_ts) OR (messages.edited = 0 AND excluded.edited = 0 AND excluded.ts < messages.ts)) AND messages.revoked = 0 AND messages.deleted_for_me = 0 AND excluded.revoked = 0 AND excluded.deleted_for_me = 0 THEN messages.sender_jid ELSE excluded.sender_jid END,
-    sender_name=CASE WHEN ((messages.edited != 0 AND excluded.edited = 0) OR (messages.edited != 0 AND excluded.edited != 0 AND excluded.edited_ts < messages.edited_ts) OR (messages.edited = 0 AND excluded.edited = 0 AND excluded.ts < messages.ts)) AND messages.revoked = 0 AND messages.deleted_for_me = 0 AND excluded.revoked = 0 AND excluded.deleted_for_me = 0 THEN messages.sender_name ELSE COALESCE(NULLIF(excluded.sender_name,''), messages.sender_name) END,
-    ts=CASE WHEN messages.revoked != 0 OR messages.deleted_for_me != 0 THEN messages.ts WHEN excluded.edited != 0 THEN messages.ts WHEN messages.edited != 0 AND excluded.edited = 0 THEN excluded.ts WHEN excluded.ts < messages.ts AND excluded.revoked = 0 AND excluded.deleted_for_me = 0 THEN messages.ts ELSE excluded.ts END,
-    from_me=CASE WHEN messages.revoked != 0 OR messages.deleted_for_me != 0 OR (((messages.edited != 0 AND excluded.edited = 0) OR (messages.edited != 0 AND excluded.edited != 0 AND excluded.edited_ts < messages.edited_ts) OR (messages.edited = 0 AND excluded.edited = 0 AND excluded.ts < messages.ts)) AND excluded.revoked = 0 AND excluded.deleted_for_me = 0) THEN messages.from_me ELSE excluded.from_me END,
-    text=CASE WHEN messages.revoked != 0 OR messages.deleted_for_me != 0 OR excluded.revoked != 0 OR excluded.deleted_for_me != 0 THEN NULL WHEN (messages.edited != 0 AND excluded.edited = 0) OR (messages.edited != 0 AND excluded.edited != 0 AND excluded.edited_ts < messages.edited_ts) OR (messages.edited = 0 AND excluded.edited = 0 AND excluded.ts < messages.ts) THEN messages.text ELSE excluded.text END,
-    display_text=CASE WHEN excluded.deleted_for_me != 0 THEN excluded.display_text WHEN messages.deleted_for_me != 0 THEN messages.display_text WHEN excluded.revoked != 0 THEN excluded.display_text WHEN messages.revoked != 0 THEN messages.display_text WHEN (messages.edited != 0 AND excluded.edited = 0) OR (messages.edited != 0 AND excluded.edited != 0 AND excluded.edited_ts < messages.edited_ts) OR (messages.edited = 0 AND excluded.edited = 0 AND excluded.ts < messages.ts) THEN messages.display_text WHEN excluded.display_text IS NOT NULL AND excluded.display_text != '' THEN excluded.display_text ELSE messages.display_text END,
-    quoted_msg_id=CASE WHEN messages.revoked != 0 OR messages.deleted_for_me != 0 OR excluded.revoked != 0 OR excluded.deleted_for_me != 0 THEN NULL WHEN (messages.edited != 0 AND excluded.edited = 0) OR (messages.edited != 0 AND excluded.edited != 0 AND excluded.edited_ts < messages.edited_ts) OR (messages.edited = 0 AND excluded.edited = 0 AND excluded.ts < messages.ts) THEN messages.quoted_msg_id ELSE COALESCE(NULLIF(excluded.quoted_msg_id,''), messages.quoted_msg_id) END,
-    quoted_sender_jid=CASE WHEN messages.revoked != 0 OR messages.deleted_for_me != 0 OR excluded.revoked != 0 OR excluded.deleted_for_me != 0 THEN NULL WHEN (messages.edited != 0 AND excluded.edited = 0) OR (messages.edited != 0 AND excluded.edited != 0 AND excluded.edited_ts < messages.edited_ts) OR (messages.edited = 0 AND excluded.edited = 0 AND excluded.ts < messages.ts) THEN messages.quoted_sender_jid ELSE COALESCE(NULLIF(excluded.quoted_sender_jid,''), messages.quoted_sender_jid) END,
-    is_forwarded=CASE WHEN ((messages.edited != 0 AND excluded.edited = 0) OR (messages.edited != 0 AND excluded.edited != 0 AND excluded.edited_ts < messages.edited_ts) OR (messages.edited = 0 AND excluded.edited = 0 AND excluded.ts < messages.ts)) AND messages.revoked = 0 AND messages.deleted_for_me = 0 AND excluded.revoked = 0 AND excluded.deleted_for_me = 0 THEN messages.is_forwarded ELSE excluded.is_forwarded END,
-    forwarding_score=CASE WHEN ((messages.edited != 0 AND excluded.edited = 0) OR (messages.edited != 0 AND excluded.edited != 0 AND excluded.edited_ts < messages.edited_ts) OR (messages.edited = 0 AND excluded.edited = 0 AND excluded.ts < messages.ts)) AND messages.revoked = 0 AND messages.deleted_for_me = 0 AND excluded.revoked = 0 AND excluded.deleted_for_me = 0 THEN messages.forwarding_score ELSE excluded.forwarding_score END,
-    reaction_to_id=CASE WHEN ((messages.edited != 0 AND excluded.edited = 0) OR (messages.edited != 0 AND excluded.edited != 0 AND excluded.edited_ts < messages.edited_ts) OR (messages.edited = 0 AND excluded.edited = 0 AND excluded.ts < messages.ts)) AND messages.revoked = 0 AND messages.deleted_for_me = 0 AND excluded.revoked = 0 AND excluded.deleted_for_me = 0 THEN messages.reaction_to_id ELSE COALESCE(NULLIF(excluded.reaction_to_id,''), messages.reaction_to_id) END,
-    reaction_emoji=CASE WHEN ((messages.edited != 0 AND excluded.edited = 0) OR (messages.edited != 0 AND excluded.edited != 0 AND excluded.edited_ts < messages.edited_ts) OR (messages.edited = 0 AND excluded.edited = 0 AND excluded.ts < messages.ts)) AND messages.revoked = 0 AND messages.deleted_for_me = 0 AND excluded.revoked = 0 AND excluded.deleted_for_me = 0 THEN messages.reaction_emoji ELSE COALESCE(NULLIF(excluded.reaction_emoji,''), messages.reaction_emoji) END,
-    media_type=CASE WHEN messages.revoked != 0 OR messages.deleted_for_me != 0 OR excluded.revoked != 0 OR excluded.deleted_for_me != 0 THEN NULL WHEN (messages.edited != 0 AND excluded.edited = 0) OR (messages.edited != 0 AND excluded.edited != 0 AND excluded.edited_ts < messages.edited_ts) OR (messages.edited = 0 AND excluded.edited = 0 AND excluded.ts < messages.ts) THEN messages.media_type ELSE excluded.media_type END,
-    media_caption=CASE WHEN messages.revoked != 0 OR messages.deleted_for_me != 0 OR excluded.revoked != 0 OR excluded.deleted_for_me != 0 THEN NULL WHEN (messages.edited != 0 AND excluded.edited = 0) OR (messages.edited != 0 AND excluded.edited != 0 AND excluded.edited_ts < messages.edited_ts) OR (messages.edited = 0 AND excluded.edited = 0 AND excluded.ts < messages.ts) THEN messages.media_caption ELSE excluded.media_caption END,
-    filename=CASE WHEN messages.revoked != 0 OR messages.deleted_for_me != 0 OR excluded.revoked != 0 OR excluded.deleted_for_me != 0 THEN NULL WHEN (messages.edited != 0 AND excluded.edited = 0) OR (messages.edited != 0 AND excluded.edited != 0 AND excluded.edited_ts < messages.edited_ts) OR (messages.edited = 0 AND excluded.edited = 0 AND excluded.ts < messages.ts) THEN messages.filename ELSE COALESCE(NULLIF(excluded.filename,''), messages.filename) END,
-    mime_type=CASE WHEN messages.revoked != 0 OR messages.deleted_for_me != 0 OR excluded.revoked != 0 OR excluded.deleted_for_me != 0 THEN NULL WHEN (messages.edited != 0 AND excluded.edited = 0) OR (messages.edited != 0 AND excluded.edited != 0 AND excluded.edited_ts < messages.edited_ts) OR (messages.edited = 0 AND excluded.edited = 0 AND excluded.ts < messages.ts) THEN messages.mime_type ELSE COALESCE(NULLIF(excluded.mime_type,''), messages.mime_type) END,
-    direct_path=CASE WHEN messages.revoked != 0 OR messages.deleted_for_me != 0 OR excluded.revoked != 0 OR excluded.deleted_for_me != 0 THEN NULL WHEN (messages.edited != 0 AND excluded.edited = 0) OR (messages.edited != 0 AND excluded.edited != 0 AND excluded.edited_ts < messages.edited_ts) OR (messages.edited = 0 AND excluded.edited = 0 AND excluded.ts < messages.ts) THEN messages.direct_path ELSE COALESCE(NULLIF(excluded.direct_path,''), messages.direct_path) END,
-    media_key=CASE WHEN messages.revoked != 0 OR messages.deleted_for_me != 0 OR excluded.revoked != 0 OR excluded.deleted_for_me != 0 THEN NULL WHEN (messages.edited != 0 AND excluded.edited = 0) OR (messages.edited != 0 AND excluded.edited != 0 AND excluded.edited_ts < messages.edited_ts) OR (messages.edited = 0 AND excluded.edited = 0 AND excluded.ts < messages.ts) THEN messages.media_key WHEN excluded.media_key IS NOT NULL AND length(excluded.media_key)>0 THEN excluded.media_key ELSE messages.media_key END,
-    file_sha256=CASE WHEN messages.revoked != 0 OR messages.deleted_for_me != 0 OR excluded.revoked != 0 OR excluded.deleted_for_me != 0 THEN NULL WHEN (messages.edited != 0 AND excluded.edited = 0) OR (messages.edited != 0 AND excluded.edited != 0 AND excluded.edited_ts < messages.edited_ts) OR (messages.edited = 0 AND excluded.edited = 0 AND excluded.ts < messages.ts) THEN messages.file_sha256 WHEN excluded.file_sha256 IS NOT NULL AND length(excluded.file_sha256)>0 THEN excluded.file_sha256 ELSE messages.file_sha256 END,
-    file_enc_sha256=CASE WHEN messages.revoked != 0 OR messages.deleted_for_me != 0 OR excluded.revoked != 0 OR excluded.deleted_for_me != 0 THEN NULL WHEN (messages.edited != 0 AND excluded.edited = 0) OR (messages.edited != 0 AND excluded.edited != 0 AND excluded.edited_ts < messages.edited_ts) OR (messages.edited = 0 AND excluded.edited = 0 AND excluded.ts < messages.ts) THEN messages.file_enc_sha256 WHEN excluded.file_enc_sha256 IS NOT NULL AND length(excluded.file_enc_sha256)>0 THEN excluded.file_enc_sha256 ELSE messages.file_enc_sha256 END,
-    file_length=CASE WHEN messages.revoked != 0 OR messages.deleted_for_me != 0 OR excluded.revoked != 0 OR excluded.deleted_for_me != 0 THEN NULL WHEN (messages.edited != 0 AND excluded.edited = 0) OR (messages.edited != 0 AND excluded.edited != 0 AND excluded.edited_ts < messages.edited_ts) OR (messages.edited = 0 AND excluded.edited = 0 AND excluded.ts < messages.ts) THEN messages.file_length WHEN excluded.file_length>0 THEN excluded.file_length ELSE messages.file_length END,
-    local_path=CASE WHEN messages.revoked != 0 OR messages.deleted_for_me != 0 OR excluded.revoked != 0 OR excluded.deleted_for_me != 0 THEN NULL ELSE messages.local_path END,
-    downloaded_at=CASE WHEN messages.revoked != 0 OR messages.deleted_for_me != 0 OR excluded.revoked != 0 OR excluded.deleted_for_me != 0 THEN NULL ELSE messages.downloaded_at END,
+    sender_jid=CASE WHEN messages.deleted_at IS NOT NULL OR excluded.deleted_at IS NOT NULL THEN COALESCE(NULLIF(messages.sender_jid,''), excluded.sender_jid) WHEN (((messages.edited != 0 AND excluded.edited = 0) OR (messages.edited != 0 AND excluded.edited != 0 AND excluded.edited_ts < messages.edited_ts) OR (messages.edited = 0 AND excluded.edited = 0 AND excluded.ts < messages.ts)) AND messages.revoked = 0 AND messages.deleted_for_me = 0 AND excluded.revoked = 0 AND excluded.deleted_for_me = 0) THEN messages.sender_jid ELSE excluded.sender_jid END,
+    sender_name=CASE WHEN messages.deleted_at IS NOT NULL OR excluded.deleted_at IS NOT NULL THEN COALESCE(NULLIF(messages.sender_name,''), excluded.sender_name) WHEN (((messages.edited != 0 AND excluded.edited = 0) OR (messages.edited != 0 AND excluded.edited != 0 AND excluded.edited_ts < messages.edited_ts) OR (messages.edited = 0 AND excluded.edited = 0 AND excluded.ts < messages.ts)) AND messages.revoked = 0 AND messages.deleted_for_me = 0 AND excluded.revoked = 0 AND excluded.deleted_for_me = 0) THEN messages.sender_name ELSE COALESCE(NULLIF(excluded.sender_name,''), messages.sender_name) END,
+    ts=CASE WHEN messages.deleted_at IS NOT NULL AND excluded.deleted_at IS NULL AND COALESCE(messages.text,'') = '' AND COALESCE(NULLIF(NULLIF(messages.display_text, 'This message was deleted'), 'This message was deleted for me'),'') = '' AND COALESCE(messages.media_type,'') = '' AND COALESCE(messages.quoted_msg_id,'') = '' AND messages.buttons IS NULL THEN excluded.ts WHEN messages.deleted_at IS NOT NULL OR excluded.deleted_at IS NOT NULL THEN messages.ts WHEN excluded.edited != 0 THEN messages.ts WHEN messages.edited != 0 AND excluded.edited = 0 THEN excluded.ts WHEN excluded.ts < messages.ts AND excluded.revoked = 0 AND excluded.deleted_for_me = 0 THEN messages.ts ELSE excluded.ts END,
+    from_me=CASE WHEN messages.deleted_at IS NOT NULL OR excluded.deleted_at IS NOT NULL THEN CASE WHEN messages.from_me != 0 OR excluded.from_me != 0 THEN 1 ELSE 0 END WHEN (((messages.edited != 0 AND excluded.edited = 0) OR (messages.edited != 0 AND excluded.edited != 0 AND excluded.edited_ts < messages.edited_ts) OR (messages.edited = 0 AND excluded.edited = 0 AND excluded.ts < messages.ts)) AND excluded.revoked = 0 AND excluded.deleted_for_me = 0) THEN messages.from_me ELSE excluded.from_me END,
+    text=CASE WHEN messages.deleted_at IS NOT NULL OR excluded.deleted_at IS NOT NULL THEN COALESCE(NULLIF(messages.text,''), excluded.text) WHEN (messages.edited != 0 AND excluded.edited = 0) OR (messages.edited != 0 AND excluded.edited != 0 AND excluded.edited_ts < messages.edited_ts) OR (messages.edited = 0 AND excluded.edited = 0 AND excluded.ts < messages.ts) THEN messages.text ELSE excluded.text END,
+    display_text=CASE WHEN messages.deleted_at IS NOT NULL OR excluded.deleted_at IS NOT NULL THEN COALESCE(NULLIF(NULLIF(NULLIF(messages.display_text,''), 'This message was deleted'), 'This message was deleted for me'), excluded.display_text) WHEN (messages.edited != 0 AND excluded.edited = 0) OR (messages.edited != 0 AND excluded.edited != 0 AND excluded.edited_ts < messages.edited_ts) OR (messages.edited = 0 AND excluded.edited = 0 AND excluded.ts < messages.ts) THEN messages.display_text WHEN excluded.display_text IS NOT NULL AND excluded.display_text != '' THEN excluded.display_text ELSE messages.display_text END,
+    quoted_msg_id=CASE WHEN messages.deleted_at IS NOT NULL OR excluded.deleted_at IS NOT NULL THEN COALESCE(NULLIF(messages.quoted_msg_id,''), excluded.quoted_msg_id) WHEN (messages.edited != 0 AND excluded.edited = 0) OR (messages.edited != 0 AND excluded.edited != 0 AND excluded.edited_ts < messages.edited_ts) OR (messages.edited = 0 AND excluded.edited = 0 AND excluded.ts < messages.ts) THEN messages.quoted_msg_id ELSE COALESCE(NULLIF(excluded.quoted_msg_id,''), messages.quoted_msg_id) END,
+    quoted_sender_jid=CASE WHEN messages.deleted_at IS NOT NULL OR excluded.deleted_at IS NOT NULL THEN COALESCE(NULLIF(messages.quoted_sender_jid,''), excluded.quoted_sender_jid) WHEN (messages.edited != 0 AND excluded.edited = 0) OR (messages.edited != 0 AND excluded.edited != 0 AND excluded.edited_ts < messages.edited_ts) OR (messages.edited = 0 AND excluded.edited = 0 AND excluded.ts < messages.ts) THEN messages.quoted_sender_jid ELSE COALESCE(NULLIF(excluded.quoted_sender_jid,''), messages.quoted_sender_jid) END,
+    is_forwarded=CASE WHEN messages.deleted_at IS NOT NULL OR excluded.deleted_at IS NOT NULL THEN CASE WHEN messages.is_forwarded != 0 OR excluded.is_forwarded != 0 THEN 1 ELSE 0 END WHEN (((messages.edited != 0 AND excluded.edited = 0) OR (messages.edited != 0 AND excluded.edited != 0 AND excluded.edited_ts < messages.edited_ts) OR (messages.edited = 0 AND excluded.edited = 0 AND excluded.ts < messages.ts)) AND messages.revoked = 0 AND messages.deleted_for_me = 0 AND excluded.revoked = 0 AND excluded.deleted_for_me = 0) THEN messages.is_forwarded ELSE excluded.is_forwarded END,
+    forwarding_score=CASE WHEN messages.deleted_at IS NOT NULL OR excluded.deleted_at IS NOT NULL THEN max(messages.forwarding_score, excluded.forwarding_score) WHEN (((messages.edited != 0 AND excluded.edited = 0) OR (messages.edited != 0 AND excluded.edited != 0 AND excluded.edited_ts < messages.edited_ts) OR (messages.edited = 0 AND excluded.edited = 0 AND excluded.ts < messages.ts)) AND messages.revoked = 0 AND messages.deleted_for_me = 0 AND excluded.revoked = 0 AND excluded.deleted_for_me = 0) THEN messages.forwarding_score ELSE excluded.forwarding_score END,
+    reaction_to_id=CASE WHEN messages.deleted_at IS NOT NULL OR excluded.deleted_at IS NOT NULL THEN COALESCE(NULLIF(messages.reaction_to_id,''), excluded.reaction_to_id) WHEN (((messages.edited != 0 AND excluded.edited = 0) OR (messages.edited != 0 AND excluded.edited != 0 AND excluded.edited_ts < messages.edited_ts) OR (messages.edited = 0 AND excluded.edited = 0 AND excluded.ts < messages.ts)) AND messages.revoked = 0 AND messages.deleted_for_me = 0 AND excluded.revoked = 0 AND excluded.deleted_for_me = 0) THEN messages.reaction_to_id ELSE COALESCE(NULLIF(excluded.reaction_to_id,''), messages.reaction_to_id) END,
+    reaction_emoji=CASE WHEN messages.deleted_at IS NOT NULL OR excluded.deleted_at IS NOT NULL THEN COALESCE(NULLIF(messages.reaction_emoji,''), excluded.reaction_emoji) WHEN (((messages.edited != 0 AND excluded.edited = 0) OR (messages.edited != 0 AND excluded.edited != 0 AND excluded.edited_ts < messages.edited_ts) OR (messages.edited = 0 AND excluded.edited = 0 AND excluded.ts < messages.ts)) AND messages.revoked = 0 AND messages.deleted_for_me = 0 AND excluded.revoked = 0 AND excluded.deleted_for_me = 0) THEN messages.reaction_emoji ELSE COALESCE(NULLIF(excluded.reaction_emoji,''), messages.reaction_emoji) END,
+    media_type=CASE WHEN messages.deleted_at IS NOT NULL OR excluded.deleted_at IS NOT NULL THEN COALESCE(NULLIF(messages.media_type,''), excluded.media_type) WHEN (messages.edited != 0 AND excluded.edited = 0) OR (messages.edited != 0 AND excluded.edited != 0 AND excluded.edited_ts < messages.edited_ts) OR (messages.edited = 0 AND excluded.edited = 0 AND excluded.ts < messages.ts) THEN messages.media_type ELSE excluded.media_type END,
+    media_caption=CASE WHEN messages.deleted_at IS NOT NULL OR excluded.deleted_at IS NOT NULL THEN COALESCE(NULLIF(messages.media_caption,''), excluded.media_caption) WHEN (messages.edited != 0 AND excluded.edited = 0) OR (messages.edited != 0 AND excluded.edited != 0 AND excluded.edited_ts < messages.edited_ts) OR (messages.edited = 0 AND excluded.edited = 0 AND excluded.ts < messages.ts) THEN messages.media_caption ELSE excluded.media_caption END,
+    filename=CASE WHEN messages.deleted_at IS NOT NULL OR excluded.deleted_at IS NOT NULL THEN COALESCE(NULLIF(messages.filename,''), excluded.filename) WHEN (messages.edited != 0 AND excluded.edited = 0) OR (messages.edited != 0 AND excluded.edited != 0 AND excluded.edited_ts < messages.edited_ts) OR (messages.edited = 0 AND excluded.edited = 0 AND excluded.ts < messages.ts) THEN messages.filename ELSE COALESCE(NULLIF(excluded.filename,''), messages.filename) END,
+    mime_type=CASE WHEN messages.deleted_at IS NOT NULL OR excluded.deleted_at IS NOT NULL THEN COALESCE(NULLIF(messages.mime_type,''), excluded.mime_type) WHEN (messages.edited != 0 AND excluded.edited = 0) OR (messages.edited != 0 AND excluded.edited != 0 AND excluded.edited_ts < messages.edited_ts) OR (messages.edited = 0 AND excluded.edited = 0 AND excluded.ts < messages.ts) THEN messages.mime_type ELSE COALESCE(NULLIF(excluded.mime_type,''), messages.mime_type) END,
+    direct_path=CASE WHEN messages.deleted_at IS NOT NULL OR excluded.deleted_at IS NOT NULL THEN COALESCE(NULLIF(messages.direct_path,''), excluded.direct_path) WHEN (messages.edited != 0 AND excluded.edited = 0) OR (messages.edited != 0 AND excluded.edited != 0 AND excluded.edited_ts < messages.edited_ts) OR (messages.edited = 0 AND excluded.edited = 0 AND excluded.ts < messages.ts) THEN messages.direct_path ELSE COALESCE(NULLIF(excluded.direct_path,''), messages.direct_path) END,
+    media_key=CASE WHEN messages.deleted_at IS NOT NULL OR excluded.deleted_at IS NOT NULL THEN CASE WHEN messages.media_key IS NOT NULL AND length(messages.media_key)>0 THEN messages.media_key ELSE excluded.media_key END WHEN (messages.edited != 0 AND excluded.edited = 0) OR (messages.edited != 0 AND excluded.edited != 0 AND excluded.edited_ts < messages.edited_ts) OR (messages.edited = 0 AND excluded.edited = 0 AND excluded.ts < messages.ts) THEN messages.media_key WHEN excluded.media_key IS NOT NULL AND length(excluded.media_key)>0 THEN excluded.media_key ELSE messages.media_key END,
+    file_sha256=CASE WHEN messages.deleted_at IS NOT NULL OR excluded.deleted_at IS NOT NULL THEN CASE WHEN messages.file_sha256 IS NOT NULL AND length(messages.file_sha256)>0 THEN messages.file_sha256 ELSE excluded.file_sha256 END WHEN (messages.edited != 0 AND excluded.edited = 0) OR (messages.edited != 0 AND excluded.edited != 0 AND excluded.edited_ts < messages.edited_ts) OR (messages.edited = 0 AND excluded.edited = 0 AND excluded.ts < messages.ts) THEN messages.file_sha256 WHEN excluded.file_sha256 IS NOT NULL AND length(excluded.file_sha256)>0 THEN excluded.file_sha256 ELSE messages.file_sha256 END,
+    file_enc_sha256=CASE WHEN messages.deleted_at IS NOT NULL OR excluded.deleted_at IS NOT NULL THEN CASE WHEN messages.file_enc_sha256 IS NOT NULL AND length(messages.file_enc_sha256)>0 THEN messages.file_enc_sha256 ELSE excluded.file_enc_sha256 END WHEN (messages.edited != 0 AND excluded.edited = 0) OR (messages.edited != 0 AND excluded.edited != 0 AND excluded.edited_ts < messages.edited_ts) OR (messages.edited = 0 AND excluded.edited = 0 AND excluded.ts < messages.ts) THEN messages.file_enc_sha256 WHEN excluded.file_enc_sha256 IS NOT NULL AND length(excluded.file_enc_sha256)>0 THEN excluded.file_enc_sha256 ELSE messages.file_enc_sha256 END,
+    file_length=CASE WHEN messages.deleted_at IS NOT NULL OR excluded.deleted_at IS NOT NULL THEN CASE WHEN messages.file_length IS NOT NULL AND messages.file_length>0 THEN messages.file_length ELSE excluded.file_length END WHEN (messages.edited != 0 AND excluded.edited = 0) OR (messages.edited != 0 AND excluded.edited != 0 AND excluded.edited_ts < messages.edited_ts) OR (messages.edited = 0 AND excluded.edited = 0 AND excluded.ts < messages.ts) THEN messages.file_length WHEN excluded.file_length>0 THEN excluded.file_length ELSE messages.file_length END,
+    local_path=messages.local_path,
+    downloaded_at=messages.downloaded_at,
+    media_unavailable_at=CASE WHEN messages.deleted_at IS NOT NULL OR excluded.deleted_at IS NOT NULL THEN messages.media_unavailable_at WHEN (messages.edited != 0 AND excluded.edited = 0) OR (messages.edited != 0 AND excluded.edited != 0 AND excluded.edited_ts < messages.edited_ts) OR (messages.edited = 0 AND excluded.edited = 0 AND excluded.ts < messages.ts) THEN messages.media_unavailable_at WHEN COALESCE(excluded.direct_path,'') != '' AND excluded.direct_path != COALESCE(messages.direct_path,'') THEN NULL ELSE messages.media_unavailable_at END,
     revoked=CASE WHEN excluded.revoked != 0 THEN 1 ELSE messages.revoked END,
     deleted_for_me=CASE WHEN excluded.deleted_for_me != 0 THEN 1 ELSE messages.deleted_for_me END,
-    edited=CASE WHEN excluded.revoked != 0 OR excluded.deleted_for_me != 0 THEN 0 WHEN excluded.edited != 0 THEN 1 WHEN messages.edited != 0 THEN messages.edited ELSE 0 END,
-    edited_ts=CASE WHEN excluded.revoked != 0 OR excluded.deleted_for_me != 0 THEN 0 WHEN excluded.edited != 0 AND (messages.edited = 0 OR excluded.edited_ts > messages.edited_ts) THEN excluded.edited_ts WHEN messages.edited != 0 THEN messages.edited_ts ELSE 0 END,
-    buttons=CASE WHEN messages.revoked != 0 OR messages.deleted_for_me != 0 OR excluded.revoked != 0 OR excluded.deleted_for_me != 0 THEN NULL WHEN (messages.edited != 0 AND excluded.edited = 0) OR (messages.edited != 0 AND excluded.edited != 0 AND excluded.edited_ts < messages.edited_ts) OR (messages.edited = 0 AND excluded.edited = 0 AND excluded.ts < messages.ts) THEN messages.buttons ELSE excluded.buttons END;
+    deleted_at=COALESCE(messages.deleted_at, excluded.deleted_at),
+    deletion_reason=CASE WHEN messages.deleted_at IS NOT NULL THEN COALESCE(NULLIF(messages.deletion_reason,''), excluded.deletion_reason) ELSE excluded.deletion_reason END,
+    edited=CASE WHEN messages.deleted_at IS NOT NULL THEN messages.edited WHEN excluded.deleted_at IS NOT NULL THEN 0 WHEN excluded.edited != 0 THEN 1 WHEN messages.edited != 0 THEN messages.edited ELSE 0 END,
+    edited_ts=CASE WHEN messages.deleted_at IS NOT NULL THEN messages.edited_ts WHEN excluded.deleted_at IS NOT NULL THEN 0 WHEN excluded.edited != 0 AND (messages.edited = 0 OR excluded.edited_ts > messages.edited_ts) THEN excluded.edited_ts WHEN messages.edited != 0 THEN messages.edited_ts ELSE 0 END,
+    buttons=CASE WHEN messages.deleted_at IS NOT NULL OR excluded.deleted_at IS NOT NULL THEN COALESCE(messages.buttons, excluded.buttons) WHEN (messages.edited != 0 AND excluded.edited = 0) OR (messages.edited != 0 AND excluded.edited != 0 AND excluded.edited_ts < messages.edited_ts) OR (messages.edited = 0 AND excluded.edited = 0 AND excluded.ts < messages.ts) THEN messages.buttons ELSE excluded.buttons END
+WHERE messages.payload_purged_at IS NULL;
 
 -- name: MarkMessageRevoked :execrows
 UPDATE messages
 SET revoked = 1,
-    text = NULL,
-    display_text = ?,
-    buttons = NULL,
-    quoted_msg_id = NULL,
-    quoted_sender_jid = NULL,
-    media_type = NULL,
-    media_caption = NULL,
-    filename = NULL,
-    mime_type = NULL,
-    direct_path = NULL,
-    media_key = NULL,
-    file_sha256 = NULL,
-    file_enc_sha256 = NULL,
-    file_length = NULL,
-    local_path = NULL,
-    downloaded_at = NULL,
+    deleted_at = COALESCE(deleted_at, ?),
+    deletion_reason = CASE WHEN deleted_at IS NULL THEN ? ELSE deletion_reason END,
     edited = 0,
     edited_ts = 0
 WHERE chat_jid = ? AND msg_id = ?;
@@ -240,22 +241,8 @@ WHERE chat_jid = ? AND msg_id = ?;
 -- name: MarkMessageDeletedForMe :execrows
 UPDATE messages
 SET deleted_for_me = 1,
-    text = NULL,
-    display_text = ?,
-    buttons = NULL,
-    quoted_msg_id = NULL,
-    quoted_sender_jid = NULL,
-    media_type = NULL,
-    media_caption = NULL,
-    filename = NULL,
-    mime_type = NULL,
-    direct_path = NULL,
-    media_key = NULL,
-    file_sha256 = NULL,
-    file_enc_sha256 = NULL,
-    file_length = NULL,
-    local_path = NULL,
-    downloaded_at = NULL,
+    deleted_at = COALESCE(deleted_at, ?),
+    deletion_reason = CASE WHEN deleted_at IS NULL THEN ? ELSE deletion_reason END,
     edited = 0,
     edited_ts = 0
 WHERE chat_jid = ? AND msg_id = ?;
@@ -263,11 +250,8 @@ WHERE chat_jid = ? AND msg_id = ?;
 -- name: MarkMessageDeletedForMePreserveMedia :execrows
 UPDATE messages
 SET deleted_for_me = 1,
-    text = NULL,
-    display_text = ?,
-    buttons = NULL,
-    quoted_msg_id = NULL,
-    quoted_sender_jid = NULL
+    deleted_at = COALESCE(deleted_at, ?),
+    deletion_reason = CASE WHEN deleted_at IS NULL THEN ? ELSE deletion_reason END
 WHERE chat_jid = ? AND msg_id = ?;
 
 -- name: UpdateMessageText :execrows
@@ -286,14 +270,12 @@ SET text = ?,
     file_length = NULL,
     local_path = NULL,
     downloaded_at = NULL,
-    revoked = 0,
-    deleted_for_me = 0,
     edited = 1,
     edited_ts = strftime('%s', 'now')
-WHERE chat_jid = ? AND msg_id = ?;
+WHERE chat_jid = ? AND msg_id = ? AND deleted_at IS NULL;
 
 -- name: GetMessage :one
-SELECT m.rowid, m.chat_jid, COALESCE(c.name,''), m.msg_id, COALESCE(m.sender_jid,''), COALESCE(m.sender_name,''), m.ts, m.from_me, COALESCE(m.text,''), COALESCE(m.display_text,''), COALESCE(m.quoted_msg_id,''), COALESCE(m.quoted_sender_jid,''), m.is_forwarded, m.forwarding_score, COALESCE(m.reaction_to_id,''), COALESCE(m.reaction_emoji,''), COALESCE(m.media_type,''), COALESCE(m.media_caption,''), COALESCE(m.filename,''), COALESCE(m.mime_type,''), COALESCE(m.direct_path,''), COALESCE(m.local_path,''), COALESCE(m.downloaded_at,0), CASE WHEN s.msg_id IS NULL THEN 0 ELSE 1 END, COALESCE(s.starred_at,0), m.revoked, m.deleted_for_me, COALESCE(m.buttons,''), ''
+SELECT m.rowid, m.chat_jid, COALESCE(c.name,''), m.msg_id, COALESCE(m.sender_jid,''), COALESCE(m.sender_name,''), m.ts, m.from_me, COALESCE(m.text,''), COALESCE(m.display_text,''), COALESCE(m.quoted_msg_id,''), COALESCE(m.quoted_sender_jid,''), m.is_forwarded, m.forwarding_score, COALESCE(m.reaction_to_id,''), COALESCE(m.reaction_emoji,''), COALESCE(m.media_type,''), COALESCE(m.media_caption,''), COALESCE(m.filename,''), COALESCE(m.mime_type,''), COALESCE(m.direct_path,''), COALESCE(m.local_path,''), COALESCE(m.downloaded_at,0), CASE WHEN s.msg_id IS NULL THEN 0 ELSE 1 END, COALESCE(s.starred_at,0), m.revoked, m.deleted_for_me, COALESCE(m.deleted_at,0), COALESCE(m.deletion_reason,''), COALESCE(m.payload_purged_at,0), m.edited, COALESCE(m.buttons,''), ''
 FROM messages m
 LEFT JOIN chats c ON c.jid = m.chat_jid
 LEFT JOIN starred s ON s.chat_jid = m.chat_jid AND s.msg_id = m.msg_id
@@ -316,21 +298,30 @@ WHERE m.chat_jid = ?
 ORDER BY m.ts DESC, m.rowid DESC
 LIMIT 1;
 
+-- name: GetNextMessageInfo :one
+SELECT m.chat_jid, m.msg_id, m.ts, m.from_me, COALESCE(m.sender_jid,''), COALESCE(m.sender_name,'')
+FROM messages m
+JOIN messages anchor ON anchor.chat_jid = m.chat_jid
+WHERE anchor.chat_jid = ? AND anchor.msg_id = ?
+  AND (m.ts, m.rowid) > (anchor.ts, anchor.rowid)
+ORDER BY m.ts ASC, m.rowid ASC
+LIMIT 1;
+
 -- name: MessageContextBefore :many
-SELECT m.rowid, m.chat_jid, COALESCE(c.name,''), m.msg_id, COALESCE(m.sender_jid,''), COALESCE(m.sender_name,''), m.ts, m.from_me, COALESCE(m.text,''), COALESCE(m.display_text,''), COALESCE(m.quoted_msg_id,''), COALESCE(m.quoted_sender_jid,''), m.is_forwarded, m.forwarding_score, COALESCE(m.reaction_to_id,''), COALESCE(m.reaction_emoji,''), COALESCE(m.media_type,''), COALESCE(m.media_caption,''), COALESCE(m.filename,''), COALESCE(m.mime_type,''), COALESCE(m.direct_path,''), COALESCE(m.local_path,''), COALESCE(m.downloaded_at,0), CASE WHEN s.msg_id IS NULL THEN 0 ELSE 1 END, COALESCE(s.starred_at,0), m.revoked, m.deleted_for_me, COALESCE(m.buttons,''), ''
+SELECT m.rowid, m.chat_jid, COALESCE(c.name,''), m.msg_id, COALESCE(m.sender_jid,''), COALESCE(m.sender_name,''), m.ts, m.from_me, COALESCE(m.text,''), COALESCE(m.display_text,''), COALESCE(m.quoted_msg_id,''), COALESCE(m.quoted_sender_jid,''), m.is_forwarded, m.forwarding_score, COALESCE(m.reaction_to_id,''), COALESCE(m.reaction_emoji,''), COALESCE(m.media_type,''), COALESCE(m.media_caption,''), COALESCE(m.filename,''), COALESCE(m.mime_type,''), COALESCE(m.direct_path,''), COALESCE(m.local_path,''), COALESCE(m.downloaded_at,0), CASE WHEN s.msg_id IS NULL THEN 0 ELSE 1 END, COALESCE(s.starred_at,0), m.revoked, m.deleted_for_me, COALESCE(m.deleted_at,0), COALESCE(m.deletion_reason,''), COALESCE(m.payload_purged_at,0), m.edited, COALESCE(m.buttons,''), ''
 FROM messages m
 LEFT JOIN chats c ON c.jid = m.chat_jid
 LEFT JOIN starred s ON s.chat_jid = m.chat_jid AND s.msg_id = m.msg_id
-WHERE m.chat_jid = ? AND m.revoked = 0 AND m.deleted_for_me = 0 AND (m.ts < ? OR (m.ts = ? AND m.rowid < ?))
+WHERE m.chat_jid = ? AND m.deleted_at IS NULL AND (m.ts < ? OR (m.ts = ? AND m.rowid < ?))
 ORDER BY m.ts DESC, m.rowid DESC
 LIMIT ?;
 
 -- name: MessageContextAfter :many
-SELECT m.rowid, m.chat_jid, COALESCE(c.name,''), m.msg_id, COALESCE(m.sender_jid,''), COALESCE(m.sender_name,''), m.ts, m.from_me, COALESCE(m.text,''), COALESCE(m.display_text,''), COALESCE(m.quoted_msg_id,''), COALESCE(m.quoted_sender_jid,''), m.is_forwarded, m.forwarding_score, COALESCE(m.reaction_to_id,''), COALESCE(m.reaction_emoji,''), COALESCE(m.media_type,''), COALESCE(m.media_caption,''), COALESCE(m.filename,''), COALESCE(m.mime_type,''), COALESCE(m.direct_path,''), COALESCE(m.local_path,''), COALESCE(m.downloaded_at,0), CASE WHEN s.msg_id IS NULL THEN 0 ELSE 1 END, COALESCE(s.starred_at,0), m.revoked, m.deleted_for_me, COALESCE(m.buttons,''), ''
+SELECT m.rowid, m.chat_jid, COALESCE(c.name,''), m.msg_id, COALESCE(m.sender_jid,''), COALESCE(m.sender_name,''), m.ts, m.from_me, COALESCE(m.text,''), COALESCE(m.display_text,''), COALESCE(m.quoted_msg_id,''), COALESCE(m.quoted_sender_jid,''), m.is_forwarded, m.forwarding_score, COALESCE(m.reaction_to_id,''), COALESCE(m.reaction_emoji,''), COALESCE(m.media_type,''), COALESCE(m.media_caption,''), COALESCE(m.filename,''), COALESCE(m.mime_type,''), COALESCE(m.direct_path,''), COALESCE(m.local_path,''), COALESCE(m.downloaded_at,0), CASE WHEN s.msg_id IS NULL THEN 0 ELSE 1 END, COALESCE(s.starred_at,0), m.revoked, m.deleted_for_me, COALESCE(m.deleted_at,0), COALESCE(m.deletion_reason,''), COALESCE(m.payload_purged_at,0), m.edited, COALESCE(m.buttons,''), ''
 FROM messages m
 LEFT JOIN chats c ON c.jid = m.chat_jid
 LEFT JOIN starred s ON s.chat_jid = m.chat_jid AND s.msg_id = m.msg_id
-WHERE m.chat_jid = ? AND m.revoked = 0 AND m.deleted_for_me = 0 AND (m.ts > ? OR (m.ts = ? AND m.rowid > ?))
+WHERE m.chat_jid = ? AND m.deleted_at IS NULL AND (m.ts > ? OR (m.ts = ? AND m.rowid > ?))
 ORDER BY m.ts ASC, m.rowid ASC
 LIMIT ?;
 
@@ -372,11 +363,55 @@ LEFT JOIN chats c ON c.jid = m.chat_jid
 WHERE m.chat_jid = ? AND m.msg_id = ?;
 
 -- name: MarkMediaDownloaded :exec
-UPDATE messages SET local_path = ?, downloaded_at = ? WHERE chat_jid = ? AND msg_id = ?;
+UPDATE messages SET local_path = ?, downloaded_at = ?, media_unavailable_at = NULL WHERE chat_jid = ? AND msg_id = ?;
+
+-- name: MarkMediaUnavailable :exec
+UPDATE messages SET media_unavailable_at = ? WHERE chat_jid = ? AND msg_id = ?;
+
+-- name: CountPendingMediaDownloads :one
+SELECT COUNT(*)
+FROM messages m
+WHERE COALESCE(m.media_type,'') != ''
+  AND COALESCE(m.direct_path,'') != ''
+  AND m.media_key IS NOT NULL AND length(m.media_key) > 0
+  AND COALESCE(m.local_path,'') = ''
+  AND m.deleted_at IS NULL
+  AND m.media_unavailable_at IS NULL
+  AND (sqlc.arg(chat_jid) = '' OR m.chat_jid = sqlc.arg(chat_jid));
+
+-- name: ListPendingMediaDownloads :many
+SELECT m.chat_jid, m.msg_id
+FROM messages m
+WHERE COALESCE(m.media_type,'') != ''
+  AND COALESCE(m.direct_path,'') != ''
+  AND m.media_key IS NOT NULL AND length(m.media_key) > 0
+  AND COALESCE(m.local_path,'') = ''
+  AND m.deleted_at IS NULL
+  AND m.media_unavailable_at IS NULL
+  AND (sqlc.arg(chat_jid) = '' OR m.chat_jid = sqlc.arg(chat_jid))
+ORDER BY m.ts DESC, m.rowid DESC
+LIMIT CASE WHEN sqlc.arg(limit_count) <= 0 THEN -1 ELSE sqlc.arg(limit_count) END;
+
+-- name: ListPendingMediaBefore :many
+SELECT m.chat_jid, m.msg_id
+FROM messages m
+WHERE COALESCE(m.media_type,'') != ''
+  AND COALESCE(m.direct_path,'') != ''
+  AND m.media_key IS NOT NULL AND length(m.media_key) > 0
+  AND COALESCE(m.local_path,'') = ''
+  AND m.deleted_at IS NULL
+  AND m.media_unavailable_at IS NULL
+  AND m.ts < sqlc.arg(before_ts)
+  AND (sqlc.arg(chat_jid) = '' OR m.chat_jid = sqlc.arg(chat_jid))
+ORDER BY m.ts DESC, m.rowid DESC
+LIMIT CASE WHEN sqlc.arg(limit_count) <= 0 THEN -1 ELSE sqlc.arg(limit_count) END;
 
 -- name: UpsertPoll :exec
 INSERT INTO polls (chat_jid, msg_id, sender_jid, question, options_json, selectable_count, created_ts)
-VALUES (?, ?, ?, ?, ?, ?, ?)
+SELECT ?, ?, ?, ?, ?, ?, ?
+WHERE NOT EXISTS (
+    SELECT 1 FROM message_payload_purges p WHERE p.chat_jid = ? AND p.msg_id = ?
+)
 ON CONFLICT(chat_jid, msg_id) DO UPDATE SET
     sender_jid = excluded.sender_jid,
     question = excluded.question,
@@ -389,14 +424,16 @@ SELECT p.chat_jid, p.msg_id, COALESCE(p.sender_jid,''), p.question, p.options_js
 FROM polls p
 LEFT JOIN messages m ON m.chat_jid = p.chat_jid AND m.msg_id = p.msg_id
 WHERE p.chat_jid = ? AND p.msg_id = ?
-  AND (m.msg_id IS NULL OR (m.revoked = 0 AND m.deleted_for_me = 0));
+  AND (m.msg_id IS NULL OR m.deleted_at IS NULL)
+  AND NOT EXISTS (SELECT 1 FROM message_payload_purges x WHERE x.chat_jid = p.chat_jid AND x.msg_id = p.msg_id);
 
 -- name: FindPollByMsgID :one
 SELECT p.chat_jid, p.msg_id, COALESCE(p.sender_jid,''), p.question, p.options_json, p.selectable_count, p.created_ts
 FROM polls p
 LEFT JOIN messages m ON m.chat_jid = p.chat_jid AND m.msg_id = p.msg_id
 WHERE p.msg_id = ?
-  AND (m.msg_id IS NULL OR (m.revoked = 0 AND m.deleted_for_me = 0))
+  AND (m.msg_id IS NULL OR m.deleted_at IS NULL)
+  AND NOT EXISTS (SELECT 1 FROM message_payload_purges x WHERE x.chat_jid = p.chat_jid AND x.msg_id = p.msg_id)
 ORDER BY p.created_ts DESC
 LIMIT 1;
 
@@ -404,7 +441,8 @@ LIMIT 1;
 SELECT p.chat_jid, p.msg_id, COALESCE(p.sender_jid,''), p.question, p.options_json, p.selectable_count, p.created_ts
 FROM polls p
 LEFT JOIN messages m ON m.chat_jid = p.chat_jid AND m.msg_id = p.msg_id
-WHERE (m.msg_id IS NULL OR (m.revoked = 0 AND m.deleted_for_me = 0))
+WHERE (m.msg_id IS NULL OR m.deleted_at IS NULL)
+  AND NOT EXISTS (SELECT 1 FROM message_payload_purges x WHERE x.chat_jid = p.chat_jid AND x.msg_id = p.msg_id)
   AND (? = '' OR p.chat_jid = ?)
 ORDER BY p.created_ts DESC, p.msg_id DESC
 LIMIT ? OFFSET ?;
@@ -414,7 +452,13 @@ SELECT options_json FROM polls WHERE chat_jid = ? AND msg_id = ?;
 
 -- name: UpsertPollVote :exec
 INSERT INTO poll_votes (chat_jid, poll_msg_id, voter_jid, vote_msg_id, selected_options_json, ts)
-VALUES (?, ?, ?, ?, ?, ?)
+SELECT ?, ?, ?, ?, ?, ?
+WHERE NOT EXISTS (
+    SELECT 1 FROM message_payload_purges p WHERE p.chat_jid = ? AND p.msg_id = ?
+)
+  AND NOT EXISTS (
+    SELECT 1 FROM message_payload_purges p WHERE p.chat_jid = ? AND p.msg_id = ?
+)
 ON CONFLICT(chat_jid, poll_msg_id, voter_jid) DO UPDATE SET
     vote_msg_id = excluded.vote_msg_id,
     selected_options_json = excluded.selected_options_json,
@@ -426,13 +470,42 @@ DELETE FROM poll_votes
 WHERE chat_jid = ? AND poll_msg_id = ? AND voter_jid = ? AND ts <= ?;
 
 -- name: ListPollVotes :many
-SELECT chat_jid, poll_msg_id, voter_jid, vote_msg_id, selected_options_json, ts
-FROM poll_votes
-WHERE chat_jid = ? AND poll_msg_id = ?
-ORDER BY ts ASC, voter_jid ASC;
+SELECT pv.chat_jid, pv.poll_msg_id, pv.voter_jid, pv.vote_msg_id, pv.selected_options_json, pv.ts
+FROM poll_votes pv
+WHERE pv.chat_jid = ? AND pv.poll_msg_id = ?
+  AND NOT EXISTS (
+      SELECT 1 FROM message_payload_purges p
+      WHERE p.chat_jid = pv.chat_jid
+        AND (p.msg_id = pv.poll_msg_id OR p.msg_id = pv.vote_msg_id)
+  )
+ORDER BY pv.ts ASC, pv.voter_jid ASC;
 
 -- name: DeletePollVotesForPoll :exec
 DELETE FROM poll_votes WHERE chat_jid = ? AND poll_msg_id = ?;
 
 -- name: DeletePoll :exec
 DELETE FROM polls WHERE chat_jid = ? AND msg_id = ?;
+
+-- name: UpsertMessageLocation :exec
+INSERT INTO message_locations (chat_jid, msg_id, latitude, longitude, name, address, is_live)
+SELECT ?, ?, ?, ?, ?, ?, ?
+WHERE NOT EXISTS (
+    SELECT 1 FROM message_payload_purges p WHERE p.chat_jid = ? AND p.msg_id = ?
+)
+ON CONFLICT(chat_jid, msg_id) DO UPDATE SET
+    latitude = excluded.latitude,
+    longitude = excluded.longitude,
+    name = excluded.name,
+    address = excluded.address,
+    is_live = excluded.is_live;
+
+-- name: GetMessageLocation :one
+SELECT chat_jid, msg_id, latitude, longitude, COALESCE(name,''), COALESCE(address,''), is_live
+FROM message_locations
+WHERE chat_jid = ? AND msg_id = ?;
+
+-- name: DeleteMessageLocation :exec
+DELETE FROM message_locations WHERE chat_jid = ? AND msg_id = ?;
+
+-- name: DeleteMessageLocationsForChat :exec
+DELETE FROM message_locations WHERE chat_jid = ?;

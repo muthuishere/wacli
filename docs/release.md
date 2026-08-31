@@ -1,43 +1,26 @@
 # Release
 
-Read when: cutting a release, debugging release artifacts, or updating the Homebrew tap handoff.
+Read when: preparing or verifying an official wacli release.
 
-## GitHub Release Artifacts
+wacli uses the fleet-standard reusable Go CLI workflow from `openclaw/release-workflows@v1`. The repository wrapper is intentionally thin: it supplies the wacli artifact contract and maps repository secrets, while the shared workflow owns source freezing, the annotated tag, builds, signing, notarization, independent verification, publication, Homebrew handoff, and the next-version closeout PR.
 
-`wacli` uses GoReleaser (`.goreleaser.yaml` for macOS, `.goreleaser-linux-windows.yaml` for linux/windows) and the GitHub Actions workflow `.github/workflows/release.yml`.
+## Release contract
 
-To cut a release:
+- Dispatch `.github/workflows/release.yml` from the protected default branch with the version to release.
+- `CHANGELOG.md` must contain exactly one dated level-two section for that version, and `cmd/wacli/root.go` must already report it.
+- The canonical GoReleaser config builds the Darwin CGO binaries on macOS.
+- `.goreleaser-linux-windows.yaml` builds Linux amd64/arm64 and Windows amd64 with the fixed cross-compilers supplied by the shared workflow.
+- `LICENSE` and `README.md` are preserved in every archive, and the published checksum asset remains `checksums.txt`.
+- Every Darwin binary retains the established `org.openclaw.wacli` identifier and OpenClaw Foundation Developer ID identity.
+- The independent rebuild must reproduce every staged Linux and Windows binary byte-for-byte before publication.
+- The published release must hand off exact verified assets to `openclaw/homebrew-tap`, then open the next patch's `Unreleased` closeout PR.
 
-1. Tag and push:
-   - `git tag vX.Y.Z`
-   - `git push origin vX.Y.Z`
-2. Wait for the GitHub Actions “release” workflow to publish the release artifacts.
+## Dispatch
 
-To re-release an existing tag, run the workflow manually and pass the tag (e.g. `v0.1.0`).
+```bash
+gh workflow run release.yml --repo openclaw/wacli --ref main -f version=0.15.1
+```
 
-Expected macOS artifact names (used by the tap updater):
+Watch the exact run through completion. A successful run is not sufficient on its own: verify the public release is non-draft and non-prerelease, its tag peels to the frozen protected-main commit, every expected asset is present, `checksums.txt` validates the downloaded assets, both native macOS verifier jobs passed, the Homebrew update run succeeded, and the closeout PR was opened.
 
-- `wacli_<version>_darwin_amd64.tar.gz`
-- `wacli_<version>_darwin_arm64.tar.gz`
-- `wacli_<version>_darwin_universal.tar.gz`
-
-Other artifacts:
-
-- `wacli-linux-<arch>.tar.gz`
-- `wacli-windows-<arch>.zip`
-
-All release builds must use `CGO_ENABLED=1`. `wacli` depends on `go-sqlite3`,
-which provides only a runtime stub when cgo is disabled; the CLI build now fails
-early if someone tries to compile it with `CGO_ENABLED=0`.
-
-## Homebrew Tap
-
-The release workflow dispatches the `Update Formula` workflow in `openclaw/homebrew-tap` after all release artifacts are published when the tap token is configured. The tap workflow owns the formula-editing logic and updates the target-specific macOS and Linux binary URLs and SHA256 values in `Formula/wacli.rb`.
-
-Optional repository secret:
-
-- `HOMEBREW_TAP_TOKEN`: token with permission to run workflows in `openclaw/homebrew-tap`
-
-If `HOMEBREW_TAP_TOKEN` is missing, release artifacts are still published and the tap update is skipped with a workflow warning.
-
-To backfill an existing release, rerun the `release` workflow manually with `tag: vX.Y.Z`.
+Retries reuse the immutable annotated version tag and its frozen commit. Never move or replace a consumer release tag to recover from a failed run; fix the shared workflow or caller on `main`, then dispatch the same version again.

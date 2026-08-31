@@ -35,13 +35,33 @@ func TestOpenCreatesExpectedSchema(t *testing.T) {
 		"reaction_emoji",
 		"local_path",
 		"downloaded_at",
+		"media_unavailable_at",
 		"revoked",
 		"deleted_for_me",
+		"deleted_at",
+		"deletion_reason",
+		"payload_purged_at",
 		"edited",
 		"edited_ts",
 	} {
 		if !cols[want] {
 			t.Fatalf("expected messages column %q to exist", want)
+		}
+	}
+	if exists, err := db.tableExists("message_payload_purges"); err != nil || !exists {
+		t.Fatalf("message_payload_purges table exists = %v, err = %v", exists, err)
+	}
+	if exists, err := db.tableExists("message_local_media_aliases"); err != nil || !exists {
+		t.Fatalf("message_local_media_aliases table exists = %v, err = %v", exists, err)
+	}
+
+	locationCols, err := tableColumns(db.sql, "message_locations")
+	if err != nil {
+		t.Fatalf("message_locations tableColumns: %v", err)
+	}
+	for _, want := range []string{"chat_jid", "msg_id", "latitude", "longitude", "name", "address", "is_live"} {
+		if !locationCols[want] {
+			t.Fatalf("expected message_locations column %q to exist", want)
 		}
 	}
 
@@ -96,6 +116,16 @@ func TestOpenCreatesExpectedSchema(t *testing.T) {
 	if !chatCols["unread_count"] {
 		t.Fatalf("expected chats unread_count column to exist")
 	}
+	if exists, err := db.tableExists("app_state_recovery_required"); err != nil {
+		t.Fatalf("app_state_recovery_required tableExists: %v", err)
+	} else if exists {
+		t.Fatal("legacy app_state_recovery_required table still exists")
+	}
+	if exists, err := db.tableExists("app_state_recovery_intents"); err != nil {
+		t.Fatalf("app_state_recovery_intents tableExists: %v", err)
+	} else if !exists {
+		t.Fatal("expected app_state_recovery_intents table to exist")
+	}
 
 	statusCols, err := tableColumns(db.sql, "status_messages")
 	if err != nil {
@@ -108,6 +138,134 @@ func TestOpenCreatesExpectedSchema(t *testing.T) {
 	}
 	if !indexExists(t, db.sql, "idx_status_messages_ts") {
 		t.Fatalf("expected status_messages timestamp index to exist")
+	}
+}
+
+func TestOpenMigratesLegacyMessageTombstonesWithoutPayloadLoss(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "wacli.db")
+	raw, err := sql.Open("sqlite3", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacySchema := strings.Replace(coreSchemaSQL, "    deleted_at INTEGER,\n    deletion_reason TEXT,\n    payload_purged_at INTEGER,\n", "", 1)
+	legacySchema = strings.Replace(legacySchema, `CREATE TABLE IF NOT EXISTS message_payload_purges (
+    chat_jid TEXT NOT NULL,
+    msg_id TEXT NOT NULL,
+    purged_at INTEGER NOT NULL,
+    deleted_at INTEGER NOT NULL,
+    deletion_reason TEXT NOT NULL,
+    PRIMARY KEY (chat_jid, msg_id)
+);
+
+`, "", 1)
+	if _, err := raw.Exec(legacySchema + `
+		CREATE TABLE schema_migrations (
+			version INTEGER PRIMARY KEY,
+			name TEXT NOT NULL,
+			applied_at INTEGER NOT NULL
+		);
+		INSERT INTO chats(jid, kind, name) VALUES('chat@s.whatsapp.net', 'dm', 'Alice');
+		INSERT INTO messages(chat_jid, msg_id, ts, from_me, text, display_text, media_type, filename, revoked, buttons)
+		VALUES('chat@s.whatsapp.net', 'mid', 123, 1, 'retained text', 'retained display', 'document', 'proof.pdf', 1, '[{"type":"url","display_text":"Open","url":"https://example.com"}]');
+	`); err != nil {
+		_ = raw.Close()
+		t.Fatalf("create legacy store: %v", err)
+	}
+	for _, migration := range schemaMigrations {
+		if migration.version >= 21 {
+			continue
+		}
+		if _, err := raw.Exec(`INSERT INTO schema_migrations(version, name, applied_at) VALUES(?, ?, 1)`, migration.version, migration.name); err != nil {
+			_ = raw.Close()
+			t.Fatal(err)
+		}
+	}
+	if err := raw.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	db, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open migrated store: %v", err)
+	}
+	defer db.Close()
+	msg, err := db.GetMessage("chat@s.whatsapp.net", "mid")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if msg.Text != "retained text" || msg.DisplayText != "retained display" || msg.MediaType != "document" || msg.Filename != "proof.pdf" || len(msg.Buttons) != 1 {
+		t.Fatalf("migrated payload = %+v", msg)
+	}
+	if msg.DeletedAt == nil || msg.DeletedAt.Unix() != 123 || msg.DeletionReason != "legacy-whatsapp-revoke" {
+		t.Fatalf("migrated tombstone = %v %q", msg.DeletedAt, msg.DeletionReason)
+	}
+}
+
+func TestTableHasColumnRejectsUnsafeIdentifier(t *testing.T) {
+	db := openTestDB(t)
+
+	if _, err := db.tableHasColumn(`messages); DROP TABLE messages; --`, "msg_id"); err == nil {
+		t.Fatalf("expected unsafe table identifier to be rejected")
+	}
+	if _, err := db.tableHasColumn("messages", `msg_id); DROP TABLE messages; --`); err == nil {
+		t.Fatalf("expected unsafe column identifier to be rejected")
+	}
+
+	if got := countRows(t, db.sql, "SELECT COUNT(*) FROM messages"); got != 0 {
+		t.Fatalf("messages table was unexpectedly modified, row count = %d", got)
+	}
+}
+
+func TestTableHasColumnAllowsSchemaIdentifiers(t *testing.T) {
+	db := openTestDB(t)
+
+	hasColumn, err := db.tableHasColumn("messages", "display_text")
+	if err != nil {
+		t.Fatalf("tableHasColumn: %v", err)
+	}
+	if !hasColumn {
+		t.Fatalf("expected messages.display_text to exist")
+	}
+}
+
+func TestOpenRepairsRecordedMediaUnavailableMigrationMissingColumn(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "wacli.db")
+	raw, err := sql.Open("sqlite3", path)
+	if err != nil {
+		t.Fatalf("sql.Open: %v", err)
+	}
+	legacySchema := strings.Replace(coreSchemaSQL, "    media_unavailable_at INTEGER,\n", "", 1)
+	if _, err := raw.Exec(legacySchema + `
+		CREATE TABLE schema_migrations (
+			version INTEGER PRIMARY KEY,
+			name TEXT NOT NULL,
+			applied_at INTEGER NOT NULL
+		);
+	`); err != nil {
+		_ = raw.Close()
+		t.Fatalf("create legacy schema: %v", err)
+	}
+	for _, migration := range schemaMigrations {
+		if _, err := raw.Exec(`INSERT INTO schema_migrations(version, name, applied_at) VALUES(?, ?, 1)`, migration.version, migration.name); err != nil {
+			_ = raw.Close()
+			t.Fatalf("record migration %d: %v", migration.version, err)
+		}
+	}
+	if err := raw.Close(); err != nil {
+		t.Fatalf("raw close: %v", err)
+	}
+
+	db, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open repaired DB: %v", err)
+	}
+	defer db.Close()
+	hasColumn, err := db.tableHasColumn("messages", "media_unavailable_at")
+	if err != nil {
+		t.Fatalf("tableHasColumn: %v", err)
+	}
+	if !hasColumn {
+		t.Fatalf("expected media_unavailable_at repair")
 	}
 }
 
@@ -478,4 +636,47 @@ func indexExists(t *testing.T, db *sql.DB, name string) bool {
 		t.Fatalf("query index %q: %v", name, err)
 	}
 	return found == name
+}
+
+func TestOpenRepairsRecordedMessageLocationsMigrationMissingTable(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "wacli.db")
+
+	db, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	raw, err := sql.Open("sqlite3", path)
+	if err != nil {
+		t.Fatalf("sql.Open: %v", err)
+	}
+	if _, err := raw.Exec(`
+		DROP TABLE message_locations;
+		INSERT OR IGNORE INTO schema_migrations(version, name, applied_at) VALUES(25, 'message locations', 1);
+	`); err != nil {
+		_ = raw.Close()
+		t.Fatalf("create inconsistent schema: %v", err)
+	}
+	if err := raw.Close(); err != nil {
+		t.Fatalf("raw close: %v", err)
+	}
+
+	db, err = Open(path)
+	if err != nil {
+		t.Fatalf("Open repaired DB: %v", err)
+	}
+	defer db.Close()
+
+	if ok, err := db.tableExists("message_locations"); err != nil || !ok {
+		t.Fatalf("message_locations exists=%v err=%v", ok, err)
+	}
+	if err := db.UpsertMessageLocation(MessageLocation{
+		ChatJID: "15551112222@s.whatsapp.net", MsgID: "LOC-1", Latitude: 1, Longitude: 2,
+	}); err != nil {
+		t.Fatalf("UpsertMessageLocation after schema repair: %v", err)
+	}
 }

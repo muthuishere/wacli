@@ -1,6 +1,7 @@
 package store
 
 import (
+	"context"
 	"time"
 
 	"github.com/openclaw/wacli/internal/store/storedb"
@@ -29,6 +30,70 @@ func (d *DB) GetMediaDownloadInfo(chatJID, msgID string) (MediaDownloadInfo, err
 		info.FileLength = uint64(row.FileLength)
 	}
 	return info, nil
+}
+
+// PendingMediaDownload identifies a message whose media has downloadable
+// metadata (direct_path + media_key) but has not yet been fetched to disk.
+type PendingMediaDownload struct {
+	ChatJID string
+	MsgID   string
+}
+
+// CountPendingMediaDownloads returns how many stored messages have downloadable
+// media that has not been fetched yet. Pass a non-empty chatJID to scope the
+// count to a single chat.
+func (d *DB) CountPendingMediaDownloads(ctx context.Context, chatJID string) (int, error) {
+	n, err := d.q.CountPendingMediaDownloads(ctx, chatJID)
+	if err != nil {
+		return 0, err
+	}
+	return int(n), nil
+}
+
+// ListPendingMediaDownloads returns messages with downloadable but not-yet-fetched
+// media, newest first. Pass a non-empty chatJID to scope to a single chat, and a
+// positive limit to cap the number of rows (limit <= 0 means no limit).
+func (d *DB) ListPendingMediaDownloads(ctx context.Context, chatJID string, limit int) ([]PendingMediaDownload, error) {
+	rows, err := d.q.ListPendingMediaDownloads(ctx, storedb.ListPendingMediaDownloadsParams{
+		ChatJid:    chatJID,
+		LimitCount: int64(limit),
+	})
+	if err != nil {
+		return nil, err
+	}
+	pending := make([]PendingMediaDownload, 0, len(rows))
+	for _, row := range rows {
+		pending = append(pending, PendingMediaDownload{ChatJID: row.ChatJid, MsgID: row.MsgID})
+	}
+	return pending, nil
+}
+
+// ListPendingMediaBefore is like ListPendingMediaDownloads but only returns
+// messages older than beforeUnix (seconds). Used to sample pending media by age.
+func (d *DB) ListPendingMediaBefore(ctx context.Context, chatJID string, beforeUnix int64, limit int) ([]PendingMediaDownload, error) {
+	rows, err := d.q.ListPendingMediaBefore(ctx, storedb.ListPendingMediaBeforeParams{
+		BeforeTs:   beforeUnix,
+		ChatJid:    chatJID,
+		LimitCount: int64(limit),
+	})
+	if err != nil {
+		return nil, err
+	}
+	pending := make([]PendingMediaDownload, 0, len(rows))
+	for _, row := range rows {
+		pending = append(pending, PendingMediaDownload{ChatJID: row.ChatJid, MsgID: row.MsgID})
+	}
+	return pending, nil
+}
+
+// MarkMediaUnavailable records that a message's media is no longer retrievable
+// (the phone reported it gone via media retry), so pending queries skip it.
+func (d *DB) MarkMediaUnavailable(ctx context.Context, chatJID, msgID string, at time.Time) error {
+	return d.q.MarkMediaUnavailable(ctx, storedb.MarkMediaUnavailableParams{
+		MediaUnavailableAt: sqlNullInt64(unix(at)),
+		ChatJid:            chatJID,
+		MsgID:              msgID,
+	})
 }
 
 func (d *DB) MarkMediaDownloaded(chatJID, msgID, localPath string, downloadedAt time.Time) error {

@@ -31,7 +31,7 @@ type WAClient interface {
 
 	AddEventHandler(handler func(interface{})) uint32
 	RemoveEventHandler(id uint32)
-	ReconnectWithBackoff(ctx context.Context, minDelay, maxDelay time.Duration) error
+	ReconnectWithBackoff(ctx context.Context, minDelay, maxDelay time.Duration, opts wa.ConnectOptions) error
 
 	ResolveChatName(ctx context.Context, chat types.JID, pushName string) string
 	ResolveLIDToPN(ctx context.Context, jid types.JID) types.JID
@@ -72,15 +72,17 @@ type WAClient interface {
 	RevokeMessage(ctx context.Context, chat types.JID, targetID types.MessageID) (types.MessageID, error)
 	DeleteMessageForMe(ctx context.Context, info types.MessageInfo, deleteMedia bool) error
 	EditMessage(ctx context.Context, chat types.JID, targetID types.MessageID, text string) (types.MessageID, error)
-	ArchiveChat(ctx context.Context, target types.JID, archive bool, lastMsgTS time.Time, lastMsgKey *waCommon.MessageKey) error
-	PinChat(ctx context.Context, target types.JID, pin bool) error
-	MuteChat(ctx context.Context, target types.JID, mute bool, duration time.Duration) error
-	MarkChatAsRead(ctx context.Context, target types.JID, read bool, lastMsgTS time.Time, lastMsgKey *waCommon.MessageKey) error
+	ArchiveChat(ctx context.Context, target types.JID, archive bool, lastMsgTS time.Time, lastMsgKey *waCommon.MessageKey, beforeApply func()) ([]interface{}, error)
+	PinChat(ctx context.Context, target types.JID, pin bool, beforeApply func()) ([]interface{}, error)
+	MuteChat(ctx context.Context, target types.JID, mute bool, duration time.Duration, beforeApply func()) ([]interface{}, error)
+	MarkChatAsRead(ctx context.Context, target types.JID, read bool, lastMsgTS time.Time, lastMsgKey *waCommon.MessageKey, beforeApply func()) ([]interface{}, error)
 	Upload(ctx context.Context, data []byte, mediaType whatsmeow.MediaType) (whatsmeow.UploadResponse, error)
 	UploadNewsletter(ctx context.Context, data []byte, mediaType whatsmeow.MediaType) (whatsmeow.UploadResponse, error)
 	DownloadMediaToFile(ctx context.Context, directPath string, encFileHash, fileHash, mediaKey []byte, fileLength uint64, mediaType, mmsType string, targetPath string) (int64, error)
+	SendMediaRetryReceipt(ctx context.Context, info *types.MessageInfo, mediaKey []byte) error
 
 	SendChatPresence(ctx context.Context, jid types.JID, state types.ChatPresence, media types.ChatPresenceMedia) error
+	SendPresence(ctx context.Context, presence types.Presence) error
 	ParseWebMessage(chatJID types.JID, webMsg *waWeb.WebMessageInfo) (*events.Message, error)
 	DecryptReaction(ctx context.Context, reaction *events.Message) (*waProto.ReactionMessage, error)
 	SetManualHistorySyncDownload(enabled bool)
@@ -88,6 +90,7 @@ type WAClient interface {
 	DeleteHistorySyncMedia(ctx context.Context, notif *waE2E.HistorySyncNotification) error
 	RequestHistorySyncOnDemand(ctx context.Context, lastKnown types.MessageInfo, count int) (types.MessageID, error)
 	FetchAppState(ctx context.Context, name string, fullSync, onlyIfNotSynced bool) error
+	FetchAppStateEvents(ctx context.Context, name string, fullSync, onlyIfNotSynced bool) ([]interface{}, error)
 	RequestAppStateRecovery(ctx context.Context, name string) (types.MessageID, error)
 	Logout(ctx context.Context) error
 	LinkedJID() string
@@ -117,6 +120,10 @@ type App struct {
 	db              *store.DB
 	statusMu        sync.Mutex
 	status          *syncStatus
+	chatStateSync   chan struct{}
+	appStatePersist appStatePersistenceSequencer
+	manualFetchMu   sync.Mutex
+	manualFetches   map[string]int
 	heartbeatLast   atomic.Int64
 }
 
@@ -143,7 +150,9 @@ func New(opts Options) (*App, error) {
 		return nil, err
 	}
 
-	return &App{opts: opts, db: db}, nil
+	chatStateSync := make(chan struct{}, 1)
+	chatStateSync <- struct{}{}
+	return &App{opts: opts, db: db, chatStateSync: chatStateSync}, nil
 }
 
 func (a *App) OpenWA() error {
@@ -175,6 +184,9 @@ func (a *App) Close() {
 	if waClient != nil {
 		waClient.Close()
 	}
+	// A completed command frontier may hand later ready tasks to a background
+	// drainer. Keep SQLite open until that drainer has finished every write.
+	_ = a.appStatePersist.waitIdle(context.Background())
 	if sessionResolver != nil {
 		_ = sessionResolver.Close()
 	}

@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	_ "github.com/mattn/go-sqlite3"
+	"github.com/openclaw/wacli/internal/sqliteutil"
 	"github.com/openclaw/wacli/internal/wa"
 	"go.mau.fi/whatsmeow/types"
 )
@@ -44,7 +45,7 @@ func readOnlySessionURI(path string) string {
 	if !sessionSQLiteSidecarsExist(path) {
 		params += "&immutable=1"
 	}
-	return fmt.Sprintf("file:%s?%s", path, params)
+	return sqliteutil.FileURI(path, params)
 }
 
 func sessionSQLiteSidecarsExist(path string) bool {

@@ -34,8 +34,31 @@ const (
 	SyncModeFollow    SyncMode = "follow"
 )
 
+type SyncPresenceMode string
+
+const (
+	SyncPresenceModeNormal SyncPresenceMode = "normal"
+	SyncPresenceModeQuiet  SyncPresenceMode = "quiet"
+)
+
+func ParseSyncPresenceMode(value string) (SyncPresenceMode, error) {
+	switch SyncPresenceMode(strings.TrimSpace(value)) {
+	case "", SyncPresenceModeNormal:
+		return SyncPresenceModeNormal, nil
+	case SyncPresenceModeQuiet:
+		return SyncPresenceModeQuiet, nil
+	default:
+		return "", fmt.Errorf("--presence-mode must be one of: normal, quiet")
+	}
+}
+
+func (m SyncPresenceMode) SendsAvailablePresence() bool {
+	return m != SyncPresenceModeQuiet
+}
+
 type SyncOptions struct {
 	Mode                SyncMode
+	PresenceMode        SyncPresenceMode
 	AllowQR             bool
 	OnQRCode            func(string)
 	PairPhoneNumber     string
@@ -54,7 +77,8 @@ type SyncOptions struct {
 	WebhookURL          string
 	WebhookSecret       string
 	WebhookAllowPrivate bool
-	Verbosity           int // future
+	WebhookEvents       SyncWebhookEventSet // nil = messages only
+	Verbosity           int                 // future
 }
 
 type SyncResult struct {
@@ -67,6 +91,9 @@ func (a *App) Sync(ctx context.Context, opts SyncOptions) (SyncResult, error) {
 
 	if opts.Mode == "" {
 		opts.Mode = SyncModeFollow
+	}
+	if opts.PresenceMode == "" {
+		opts.PresenceMode = SyncPresenceModeNormal
 	}
 	if (opts.Mode == SyncModeBootstrap || opts.Mode == SyncModeOnce) && opts.IdleExit <= 0 {
 		opts.IdleExit = 30 * time.Second
@@ -113,42 +140,58 @@ func (a *App) Sync(ctx context.Context, opts SyncOptions) (SyncResult, error) {
 	lastEvent.Store(now)
 
 	disconnected := make(chan struct{}, 1)
+	loggedOut := make(chan struct{}, 1)
 	staleReconnect := make(chan staleReconnectRequest, 1)
 
-	var stopMedia func()
-	var mediaJobs chan mediaJob
+	var waitMedia func(context.Context) bool
+	var mediaQ *mediaQueue
 	enqueueMedia := func(chatJID, msgID string) {}
 	if opts.DownloadMedia {
-		mediaJobs = make(chan mediaJob, 512)
-		enqueueMedia = newMediaEnqueuer(syncCtx, mediaJobs)
+		mediaQ = newMediaQueue(512)
+		enqueueMedia = newMediaEnqueuer(syncCtx, mediaQ)
 	}
 
 	if opts.DownloadMedia {
-		var err error
-		stopMedia, err = a.runMediaWorkers(syncCtx, mediaJobs, 4)
+		wait, cancelMedia, err := a.runMediaWorkers(syncCtx, mediaQ, 4)
 		if err != nil {
 			return SyncResult{}, err
 		}
-		defer stopMedia()
+		defer func() {
+			cancelMedia()
+			wait()
+		}()
+		waitMedia = mediaQ.waitIdle
 	}
 
 	var stopWebhook func()
-	var webhookJobs chan wa.ParsedMessage
-	enqueueWebhook := func(wa.ParsedMessage) {}
+	var webhookJobs chan syncWebhookEvent
+	enqueueWebhook := func(syncWebhookEvent) {}
 	if syncWebhookEnabled(opts) {
-		webhookJobs = make(chan wa.ParsedMessage, 512)
+		webhookJobs = make(chan syncWebhookEvent, 512)
 		enqueueWebhook = a.newSyncWebhookEnqueuer(syncCtx, webhookJobs)
 		stopWebhook = a.runSyncWebhookWorker(syncCtx, opts, webhookJobs)
 		defer stopWebhook()
 	}
 
-	handlerID := a.addSyncEventHandler(syncCtx, opts, &messagesStored, &lastEvent, disconnected, staleReconnect, enqueueMedia, enqueueWebhook, limits)
+	ps := &syncPresence{}
+	handlerID := a.addSyncEventHandler(syncCtx, opts, &messagesStored, &lastEvent, disconnected, loggedOut, staleReconnect, enqueueMedia, enqueueWebhook, limits, ps, mediaQ)
 	defer a.wa.RemoveEventHandler(handlerID)
 
 	connectionEpoch.Store(nowUTC().UnixNano())
 	if err := a.connectForSync(syncCtx, opts); err != nil {
 		return SyncResult{}, err
 	}
+	// Ensure unavailable presence is sent on ALL post-connect exits
+	// (success, error, storage limit, reconnect failure), not just the
+	// success path. The websocket stays alive via DetachSocket, so the
+	// send can complete even after the sync context is cancelled.
+	defer func() {
+		ps.mu.Lock()
+		ps.cleanupStarted = true
+		ps.mu.Unlock()
+		a.wa.RemoveEventHandler(handlerID)
+		a.sendPresenceBounded(types.PresenceUnavailable)
+	}()
 	now = nowUTC().UnixNano()
 	lastEvent.Store(now)
 	if err := a.migrateHistoricalLIDs(syncCtx); err != nil {
@@ -192,11 +235,19 @@ func (a *App) Sync(ctx context.Context, opts SyncOptions) (SyncResult, error) {
 
 	var err error
 	if opts.Mode == SyncModeFollow {
-		_, err = a.runSyncFollow(syncCtx, opts.MaxReconnect, &messagesStored, &connectionEpoch, disconnected, staleReconnect)
+		_, err = a.runSyncFollow(syncCtx, opts.MaxReconnect, opts.PresenceMode, &messagesStored, &connectionEpoch, disconnected, loggedOut, staleReconnect)
 	} else {
-		_, err = a.runSyncUntilIdle(syncCtx, opts.IdleExit, opts.MaxReconnect, &messagesStored, &lastEvent, disconnected)
+		_, err = a.runSyncUntilIdle(syncCtx, opts.IdleExit, opts.MaxReconnect, opts.PresenceMode, &messagesStored, &lastEvent, disconnected, loggedOut)
 	}
-	if limitErr := limits.Err(); limitErr != nil {
+	limitErr := limits.Err()
+	// Successful one-shot modes must finish queued downloads before cleanup
+	// cancels the worker context. Follow mode keeps the queue open; error,
+	// cancellation, and storage-limit exits retain immediate cancellation.
+	if waitMedia != nil && opts.Mode != SyncModeFollow && err == nil && limitErr == nil && syncCtx.Err() == nil {
+		waitMedia(syncCtx)
+		limitErr = limits.Err()
+	}
+	if limitErr != nil {
 		return SyncResult{MessagesStored: messagesStored.Load()}, limitErr
 	}
 	if err != nil {
@@ -220,10 +271,15 @@ func (a *App) syncAppStateDeltas(ctx context.Context) {
 
 func (a *App) connectForSync(ctx context.Context, opts SyncOptions) error {
 	connectOpts := wa.ConnectOptions{
-		AllowQR:         opts.AllowQR,
-		OnQRCode:        opts.OnQRCode,
-		PairPhoneNumber: opts.PairPhoneNumber,
-		OnPairCode:      opts.OnPairCode,
+		AllowQR:                          opts.AllowQR,
+		OnQRCode:                         opts.OnQRCode,
+		PairPhoneNumber:                  opts.PairPhoneNumber,
+		OnPairCode:                       opts.OnPairCode,
+		SuppressInitialAvailablePresence: !opts.PresenceMode.SendsAvailablePresence(),
+		// Only detach for already-authenticated sync, not for auth
+		// bootstrap (AllowQR / phone pairing) where caller
+		// cancellation must bound the QR/pairing flow.
+		DetachSocket: opts.AllowQR == false && opts.PairPhoneNumber == "",
 	}
 
 	attempts := 1
@@ -396,7 +452,8 @@ func (a *App) storeParsedMessage(ctx context.Context, pm wa.ParsedMessage) error
 	// Best-effort: store group metadata (and participants) when available.
 	if pm.Chat.Server == types.GroupServer {
 		if gi, err := a.wa.GetGroupInfo(ctx, pm.Chat); err == nil && gi != nil {
-			_ = a.db.UpsertGroupWithHierarchy(gi.JID.String(), gi.GroupName.Name, gi.OwnerJID.String(), gi.GroupCreated, gi.IsParent, gi.LinkedParentJID.String())
+			ownerJID := a.canonicalStoreJID(ctx, gi.OwnerJID).String()
+			_ = a.db.UpsertGroupWithHierarchy(gi.JID.String(), gi.GroupName.Name, ownerJID, gi.GroupCreated, gi.IsParent, gi.LinkedParentJID.String())
 			var ps []store.GroupParticipant
 			for _, p := range gi.Participants {
 				role := "member"
@@ -407,7 +464,7 @@ func (a *App) storeParsedMessage(ctx context.Context, pm wa.ParsedMessage) error
 				}
 				ps = append(ps, store.GroupParticipant{
 					GroupJID: pm.Chat.String(),
-					UserJID:  canonicalJIDString(p.JID),
+					UserJID:  a.canonicalStoreJID(ctx, p.JID).String(),
 					Role:     role,
 				})
 			}
@@ -466,7 +523,7 @@ func (a *App) storeParsedMessage(ctx context.Context, pm wa.ParsedMessage) error
 		Text:            pm.Text,
 		DisplayText:     displayText,
 		QuotedMsgID:     pm.ReplyToID,
-		QuotedSenderJID: pm.ReplyToSenderJID,
+		QuotedSenderJID: a.canonicalStoreJIDString(ctx, pm.ReplyToSenderJID),
 		Buttons:         waButtonsToStore(pm.Buttons),
 		IsForwarded:     pm.IsForwarded,
 		ForwardingScore: pm.ForwardingScore,
@@ -485,6 +542,20 @@ func (a *App) storeParsedMessage(ctx context.Context, pm wa.ParsedMessage) error
 		Revoked:         pm.Revoked,
 	}); err != nil {
 		return err
+	}
+	a.warnUnhandledPayload(pm)
+	if pm.Location != nil {
+		if err := a.db.UpsertMessageLocation(store.MessageLocation{
+			ChatJID:   chatJID,
+			MsgID:     pm.ID,
+			Latitude:  pm.Location.Latitude,
+			Longitude: pm.Location.Longitude,
+			Name:      pm.Location.Name,
+			Address:   pm.Location.Address,
+			IsLive:    pm.Location.IsLive,
+		}); err != nil {
+			return err
+		}
 	}
 	if pm.Call != nil {
 		pm.Call.Chat = pm.Chat
@@ -645,6 +716,32 @@ func (a *App) buildDisplayText(ctx context.Context, pm wa.ParsedMessage) string 
 	return base
 }
 
+// warnUnhandledPayload surfaces messages whose payload produced no content, so
+// the resulting "(message)" placeholder is diagnosable. Without it the row is
+// indistinguishable from a message that genuinely carried nothing, and any
+// consumer reading local history silently sees a gap it cannot account for.
+//
+// Called only after the message upsert succeeds: the warning states that the
+// row was stored, so emitting it earlier would report a write that may still
+// fail.
+func (a *App) warnUnhandledPayload(pm wa.ParsedMessage) {
+	if pm.UnhandledPayload == "" {
+		return
+	}
+	a.emitWarning(
+		"unhandled_message_payload",
+		fmt.Sprintf(
+			"stored message %s in %s without content: unhandled payload %s",
+			pm.ID, canonicalJIDString(pm.Chat), pm.UnhandledPayload,
+		),
+		map[string]any{
+			"chat_jid": canonicalJIDString(pm.Chat),
+			"msg_id":   pm.ID,
+			"payload":  pm.UnhandledPayload,
+		},
+	)
+}
+
 func baseDisplayText(pm wa.ParsedMessage) string {
 	if pm.Call != nil {
 		return callDisplayText(*pm.Call)
@@ -727,6 +824,8 @@ func mediaLabel(mediaType string) string {
 		return "document"
 	case "location":
 		return "location"
+	case "live_location":
+		return "live location"
 	case "contact":
 		return "contact"
 	case "contacts":
