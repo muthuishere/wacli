@@ -5,13 +5,14 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"os"
-	"path/filepath"
-	"sync"
+	"strings"
 	"time"
 
 	"github.com/openclaw/wacli/internal/app"
+	"github.com/openclaw/wacli/internal/delegate"
 	"github.com/openclaw/wacli/internal/lock"
 	"github.com/openclaw/wacli/internal/out"
 	"github.com/openclaw/wacli/internal/wa"
@@ -20,8 +21,11 @@ import (
 
 const (
 	sendDelegateVersion       = 1
-	sendDelegateSocketName    = ".send.sock"
 	sendDelegateResponseGrace = 5 * time.Second
+	// sendDelegateReplyMargin is reserved before the caller's deadline so a
+	// refusal can reach the caller before it gives up on the connection. An
+	// explicit "not sent" is only useful if it arrives.
+	sendDelegateReplyMargin = 500 * time.Millisecond
 )
 
 var errSendDelegateUnavailable = errors.New("send delegate unavailable")
@@ -36,6 +40,7 @@ type sendDelegateRequest struct {
 	ReplyTo              string   `json:"reply_to,omitempty"`
 	ReplyToSender        string   `json:"reply_to_sender,omitempty"`
 	NoPreview            bool     `json:"no_preview,omitempty"`
+	AllowSelf            bool     `json:"allow_self,omitempty"`
 	Ephemeral            bool     `json:"ephemeral,omitempty"`
 	EphemeralDuration    string   `json:"ephemeral_duration,omitempty"`
 	EphemeralDurationSet bool     `json:"ephemeral_duration_set,omitempty"`
@@ -60,30 +65,49 @@ type sendDelegateRequest struct {
 	Selectable           int      `json:"selectable,omitempty"`
 	PresenceState        string   `json:"presence_state,omitempty"`
 	PresenceMedia        string   `json:"presence_media,omitempty"`
+	PresenceWaitMS       int64    `json:"presence_wait_ms,omitempty"`
+	Read                 *bool    `json:"read,omitempty"`
+	Receipts             bool     `json:"receipts,omitempty"`
+	ThroughMessageID     string   `json:"through_message_id,omitempty"`
+	Phones               []string `json:"phones,omitempty"`
+	FirstName            string   `json:"first_name,omitempty"`
+	AccountWide          bool     `json:"account_wide,omitempty"`
+	Phonebook            bool     `json:"phonebook,omitempty"`
+	ChatStateAction      string   `json:"chat_state_action,omitempty"`
+	MuteDurationMS       int64    `json:"mute_duration_ms,omitempty"`
 	PostSendWaitMS       int64    `json:"post_send_wait_ms,omitempty"`
 	TimeoutMS            int64    `json:"timeout_ms,omitempty"`
 	DeadlineUnixMS       int64    `json:"deadline_unix_ms,omitempty"`
+	RetryOnPhone         bool     `json:"retry_on_phone,omitempty"`
 }
 
 type sendDelegateResponse struct {
-	OK             bool              `json:"ok"`
-	Error          string            `json:"error,omitempty"`
-	Sent           bool              `json:"sent,omitempty"`
-	To             string            `json:"to,omitempty"`
-	ID             string            `json:"id,omitempty"`
-	Target         string            `json:"target,omitempty"`
-	Reaction       string            `json:"reaction,omitempty"`
-	Question       string            `json:"question,omitempty"`
-	Options        []string          `json:"options,omitempty"`
-	Selected       []string          `json:"selected,omitempty"`
-	SelectedOption *selectOption     `json:"selected_option,omitempty"`
-	File           map[string]string `json:"file,omitempty"`
-	StoreWarning   string            `json:"store_warning,omitempty"`
+	OK             bool                 `json:"ok"`
+	Error          string               `json:"error,omitempty"`
+	Sent           bool                 `json:"sent,omitempty"`
+	To             string               `json:"to,omitempty"`
+	ID             string               `json:"id,omitempty"`
+	Target         string               `json:"target,omitempty"`
+	Reaction       string               `json:"reaction,omitempty"`
+	Question       string               `json:"question,omitempty"`
+	Options        []string             `json:"options,omitempty"`
+	Selected       []string             `json:"selected,omitempty"`
+	SelectedOption *selectOption        `json:"selected_option,omitempty"`
+	File           map[string]string    `json:"file,omitempty"`
+	StoreWarning   string               `json:"store_warning,omitempty"`
+	PreviewWarning string               `json:"preview_warning,omitempty"`
+	ThumbWarning   string               `json:"thumbnail_warning,omitempty"`
+	Chat           string               `json:"chat,omitempty"`
+	Action         string               `json:"action,omitempty"`
+	Receipts       *int                 `json:"receipts,omitempty"`
+	ReceiptType    string               `json:"receipt_type,omitempty"`
+	Contacts       []contactCheckResult `json:"contacts,omitempty"`
+	Contact        *contactSaveResult   `json:"contact,omitempty"`
+	Presence       *app.PresenceState   `json:"presence,omitempty"`
+	Media          *mediaDownloadResult `json:"media,omitempty"`
 }
 
-func sendDelegateSocketPath(storeDir string) string {
-	return filepath.Join(storeDir, sendDelegateSocketName)
-}
+type sendDelegateExecutor func(context.Context, sendDelegateRequest) (sendDelegateResponse, error)
 
 func delegateSend(ctx context.Context, flags *rootFlags, req sendDelegateRequest) (sendDelegateResponse, error) {
 	req.Version = sendDelegateVersion
@@ -92,16 +116,24 @@ func delegateSend(ctx context.Context, flags *rootFlags, req sendDelegateRequest
 	if err != nil {
 		return sendDelegateResponse{}, err
 	}
-	path := sendDelegateSocketPath(storeDir)
-
-	var d net.Dialer
-	conn, err := d.DialContext(ctx, "unix", path)
+	conn, err := delegate.Dial(ctx, storeDir)
 	if err != nil {
 		return sendDelegateResponse{}, fmt.Errorf("%w: %v", errSendDelegateUnavailable, err)
 	}
 	defer conn.Close()
 
 	deadline := time.Now().Add(commandTimeout(flags))
+	if req.Kind == mediaDownloadKind {
+		// Cache inspection and lock waits already consumed this command's
+		// budget. Never grant recovery a new full timeout after those stages.
+		if parentDeadline, ok := ctx.Deadline(); ok && parentDeadline.Before(deadline) {
+			deadline = parentDeadline
+		}
+		// DialContext alone does not cancel an established socket. Closing it
+		// wakes a blocked read and tells the owner to cancel this media request.
+		stopCancel := context.AfterFunc(ctx, func() { _ = conn.Close() })
+		defer stopCancel()
+	}
 	req.DeadlineUnixMS = deadline.UnixMilli()
 	_ = conn.SetDeadline(deadline)
 	if err := json.NewEncoder(conn).Encode(req); err != nil {
@@ -109,6 +141,18 @@ func delegateSend(ctx context.Context, flags *rootFlags, req sendDelegateRequest
 	}
 	var resp sendDelegateResponse
 	if err := json.NewDecoder(conn).Decode(&resp); err != nil {
+		if req.Kind == mediaDownloadKind && ctx.Err() != nil {
+			return sendDelegateResponse{}, fmt.Errorf("media caller stopped waiting; recovery may have completed, check the exact local file before retrying: %w", ctx.Err())
+		}
+		var netErr net.Error
+		if errors.As(err, &netErr) && netErr.Timeout() {
+			if req.Kind == mediaDownloadKind {
+				return sendDelegateResponse{}, fmt.Errorf("no recovery reply before the timeout; check the exact verified local file before retrying: %w", err)
+			}
+			// The request reached the daemon, which may have started it just
+			// before the deadline. Say so, because a blind retry can send twice.
+			return sendDelegateResponse{}, fmt.Errorf("no reply from the running sync process before the timeout; the %s may still have gone through, so check before retrying: %w", req.Kind, err)
+		}
 		return sendDelegateResponse{}, err
 	}
 	if !resp.OK {
@@ -132,27 +176,27 @@ func tryDelegateSend(ctx context.Context, flags *rootFlags, lockErr error, req s
 }
 
 func startSendDelegateServer(ctx context.Context, a *app.App, spacing sendSpacing) (func(), error) {
-	path := sendDelegateSocketPath(a.StoreDir())
-	if err := removeStaleSendDelegateSocket(path); err != nil {
-		return nil, err
-	}
-	ln, err := net.Listen("unix", path)
+	return startSendDelegateServerForStore(ctx, a.StoreDir(), spacing, func(ctx context.Context, req sendDelegateRequest) (sendDelegateResponse, error) {
+		return executeDelegatedSend(ctx, a, req)
+	})
+}
+
+func startSendDelegateServerForStore(ctx context.Context, storeDir string, spacing sendSpacing, execute sendDelegateExecutor) (func(), error) {
+	ln, err := delegate.Listen(storeDir)
 	if err != nil {
-		return nil, err
-	}
-	if err := os.Chmod(path, 0o600); err != nil {
-		_ = ln.Close()
-		_ = os.Remove(path)
 		return nil, err
 	}
 
 	done := make(chan struct{})
-	var sendMu sync.Mutex
-	var pacedSendSlot chan struct{}
-	if spacing.enabled() {
-		pacedSendSlot = make(chan struct{}, 1)
-		pacedSendSlot <- struct{}{}
-	}
+	// One slot serializes delegated operations. Waiting for it is bounded by
+	// each caller's deadline, paced or not, so an operation still queued when
+	// its caller gives up is refused instead of running late (#446).
+	sendSlot := make(chan struct{}, 1)
+	sendSlot <- struct{}{}
+	// Media waits never consume a send slot. A separate per-owner slot ensures
+	// concurrent exact downloads recheck the cache before requesting the phone.
+	mediaSlot := make(chan struct{}, 1)
+	mediaSlot <- struct{}{}
 	// One pacer shared across connections: it spaces the serialized delegated
 	// sends so a burst of `wacli send` processes delegating to this daemon
 	// leaves the wire paced instead of back-to-back. Disabled = no-op.
@@ -164,33 +208,24 @@ func startSendDelegateServer(ctx context.Context, a *app.App, spacing sendSpacin
 			if err != nil {
 				return
 			}
-			go handleSendDelegateConn(ctx, conn, a, &sendMu, pacedSendSlot, pacer)
+			go handleSendDelegateConn(ctx, conn, execute, sendSlot, pacer, mediaSlot)
 		}
 	}()
 
 	stop := func() {
 		_ = ln.Close()
 		<-done
-		_ = os.Remove(path)
 	}
 	return stop, nil
 }
 
-func removeStaleSendDelegateSocket(path string) error {
-	info, err := os.Lstat(path)
-	if errors.Is(err, os.ErrNotExist) {
-		return nil
+func handleSendDelegateConn(ctx context.Context, conn net.Conn, execute sendDelegateExecutor, sendSlot chan struct{}, pacer *sendPacer, mediaSlots ...chan struct{}) {
+	// Existing direct handler tests omit media support; the production server
+	// supplies one shared media slot across all of its accepted connections.
+	var mediaSlot chan struct{}
+	if len(mediaSlots) != 0 {
+		mediaSlot = mediaSlots[0]
 	}
-	if err != nil {
-		return err
-	}
-	if info.Mode()&os.ModeSocket == 0 {
-		return fmt.Errorf("%s exists and is not a socket", path)
-	}
-	return os.Remove(path)
-}
-
-func handleSendDelegateConn(ctx context.Context, conn net.Conn, a *app.App, sendMu *sync.Mutex, pacedSendSlot chan struct{}, pacer *sendPacer) {
 	defer conn.Close()
 	_ = conn.SetDeadline(time.Now().Add(5 * time.Minute))
 
@@ -199,66 +234,136 @@ func handleSendDelegateConn(ctx context.Context, conn net.Conn, a *app.App, send
 		_ = json.NewEncoder(conn).Encode(sendDelegateResponse{OK: false, Error: err.Error()})
 		return
 	}
-	requestCtx := ctx
-	if pacer.enabled() {
-		deadline := time.Now().Add(millisDuration(req.TimeoutMS, 5*time.Minute))
-		if req.DeadlineUnixMS > 0 {
-			callerDeadline := time.UnixMilli(req.DeadlineUnixMS)
-			if callerDeadline.Before(deadline) {
-				deadline = callerDeadline
-			}
-		}
-		var cancel context.CancelFunc
-		requestCtx, cancel = context.WithDeadline(ctx, deadline)
-		defer cancel()
-		if requestDeadline, ok := requestCtx.Deadline(); ok {
-			// The fixed initial deadline only protects request decoding. A paced
-			// request may intentionally run longer than five minutes, so keep the
-			// transport alive through its budget and the final response write.
-			_ = conn.SetDeadline(requestDeadline.Add(sendDelegateResponseGrace))
+
+	// Every request gets one budget: its own timeout, capped by the caller's
+	// absolute deadline less the reply margin. Queueing, pacing and the
+	// operation itself all share it.
+	deadline := time.Now().Add(millisDuration(req.TimeoutMS, 5*time.Minute))
+	if req.DeadlineUnixMS > 0 {
+		callerDeadline := time.UnixMilli(req.DeadlineUnixMS)
+		if callerDeadline.Before(deadline) {
+			deadline = callerDeadline
 		}
 	}
+	// Reserve at most a tenth of the remaining budget for the reply, so
+	// sub-second requests still have time to execute.
+	if remaining := time.Until(deadline); remaining > 0 {
+		deadline = deadline.Add(-min(sendDelegateReplyMargin, remaining/10))
+	}
+	requestCtx, cancel := context.WithDeadline(ctx, deadline)
+	defer cancel()
+	deadline, _ = requestCtx.Deadline()
+	// The fixed initial deadline only protects request decoding. A queued or
+	// paced request may intentionally run longer than five minutes, so keep the
+	// transport alive through its budget and the final response write.
+	_ = conn.SetDeadline(deadline.Add(sendDelegateResponseGrace))
 
-	if pacer.enabled() {
+	if req.Kind == mediaDownloadKind {
+		if mediaSlot == nil || req.Version != sendDelegateVersion {
+			_ = json.NewEncoder(conn).Encode(sendDelegateResponse{OK: false, Error: "unsupported media recovery delegate"})
+			return
+		}
+		// Requests carry one JSON value and clients leave the socket open for
+		// the reply. A peer disconnect cancels queued or running recovery; it
+		// must not silently continue after a canceled caller goes away.
+		// Drain trailing framing bytes, including a split JSON newline; only
+		// EOF/read failure denotes disconnection, not that harmless whitespace.
+		go func() { _, _ = io.Copy(io.Discard, conn); cancel() }()
 		select {
 		case <-requestCtx.Done():
-			_ = json.NewEncoder(conn).Encode(sendDelegateResponse{
-				OK:    false,
-				Error: "send spacing exceeded request timeout before dispatch",
-			})
+			_ = json.NewEncoder(conn).Encode(sendDelegateResponse{OK: false, Error: "media request expired before recovery dispatch"})
 			return
-		case <-pacedSendSlot:
-			defer func() { pacedSendSlot <- struct{}{} }()
+		case <-mediaSlot:
+			defer func() { mediaSlot <- struct{}{} }()
 		}
-	} else {
-		// Preserve the original unpaced serialization path exactly when the
-		// opt-in flag is unset.
-		sendMu.Lock()
-		defer sendMu.Unlock()
+		if requestCtx.Err() != nil {
+			_ = json.NewEncoder(conn).Encode(sendDelegateResponse{OK: false, Error: "media request expired before recovery dispatch"})
+			return
+		}
+		resp, err := execute(requestCtx, req)
+		// A lost answer is uncertain recovery, never permission to repeat a
+		// phone request without reconciling the exact verified local file.
+		if err != nil {
+			resp = sendDelegateResponse{OK: false, Error: err.Error()}
+		}
+		_ = json.NewEncoder(conn).Encode(resp)
+		return
+	}
+	if req.Kind == chatStateKind || req.Kind == contactsSaveKind {
+		// The app-state coordinator owns these writes; recovery must not hold
+		// the message-send queue (#454).
+		if requestCtx.Err() != nil {
+			_ = json.NewEncoder(conn).Encode(sendDelegateResponse{OK: false, Error: "request deadline passed before dispatch; it was not sent"})
+			return
+		}
+		resp, err := execute(requestCtx, req)
+		writeDelegateResult(conn, requestCtx, req, resp, err)
+		return
+	}
+	if req.Kind == presenceSubscribeKind {
+		// Watching presence puts nothing in a chat, and it may wait for an
+		// answer: it neither queues behind sends nor takes a paced send slot,
+		// but it keeps the same budget.
+		resp, err := execute(requestCtx, req)
+		if err != nil {
+			resp = sendDelegateResponse{OK: false, Error: err.Error()}
+		}
+		_ = json.NewEncoder(conn).Encode(resp)
+		return
+	}
+
+	refuse := func() {
+		msg := "request timed out in the send queue before dispatch; it was not sent"
+		if pacer.enabled() {
+			msg = "send spacing exceeded request timeout before dispatch; it was not sent"
+		}
+		_ = json.NewEncoder(conn).Encode(sendDelegateResponse{OK: false, Error: msg})
+	}
+
+	select {
+	case <-requestCtx.Done():
+		refuse()
+		return
+	case <-sendSlot:
+		defer func() { sendSlot <- struct{}{} }()
+	}
+	// select picks at random when the slot frees up at the same moment the
+	// deadline passes. Never start an operation after its caller gave up.
+	if requestCtx.Err() != nil || !time.Now().Before(deadline) {
+		refuse()
+		return
 	}
 
 	// Space this send from the previous one while serialized. Bound the wait by
-	// the caller's request timeout, including time spent waiting for earlier
-	// delegated sends, and have pacing + send share that one deadline. Disabled
-	// spacing leaves the path untouched.
+	// the same deadline. Disabled spacing leaves the path untouched.
 	if pacer.enabled() {
 		if !pacer.wait(requestCtx) {
-			_ = json.NewEncoder(conn).Encode(sendDelegateResponse{
-				OK:    false,
-				Error: "send spacing exceeded request timeout before dispatch",
-			})
+			refuse()
 			return
 		}
 	}
 
-	resp, err := executeDelegatedSend(requestCtx, a, req)
+	// Timer delivery can lag wall-clock expiry, including while pacing.
+	if requestCtx.Err() != nil || !time.Now().Before(deadline) {
+		refuse()
+		return
+	}
+
+	resp, err := execute(requestCtx, req)
 	if pacer.enabled() {
 		// Record completion, not handler entry: recipient resolution, media
 		// preparation, and the actual wire send all happen inside execute.
 		// Starting the gap here prevents a slow operation from consuming it.
 		pacer.record()
 	}
+	writeDelegateResult(conn, requestCtx, req, resp, err)
+}
+
+func writeDelegateResult(conn net.Conn, requestCtx context.Context, req sendDelegateRequest, resp sendDelegateResponse, err error) {
 	if err != nil {
+		if requestCtx.Err() != nil || errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+			err = fmt.Errorf("delegated %s failed after dispatch and may still have gone through; check before retrying: %w", req.Kind, err)
+		}
 		resp = sendDelegateResponse{OK: false, Error: err.Error()}
 	}
 	_ = json.NewEncoder(conn).Encode(resp)
@@ -272,6 +377,12 @@ func executeDelegatedSend(parent context.Context, a *app.App, req sendDelegateRe
 	defer cancel()
 
 	switch req.Kind {
+	case mediaDownloadKind:
+		if req.To == "" || req.ID == "" {
+			return sendDelegateResponse{}, fmt.Errorf("exact media chat and message ID are required")
+		}
+		result, err := executeExactMediaDownload(ctx, a, req.To, req.ID, req.RetryOnPhone)
+		return sendDelegateResponse{OK: err == nil, Media: result}, err
 	case "text":
 		return executeDelegatedText(ctx, a, req)
 	case "file", "voice":
@@ -290,11 +401,114 @@ func executeDelegatedSend(parent context.Context, a *app.App, req sendDelegateRe
 		return executeDelegatedButtonListSelect(ctx, a, req)
 	case "presence":
 		return executeDelegatedPresence(ctx, a, req)
+	case presenceSubscribeKind:
+		return executeDelegatedPresenceSubscribe(ctx, a, req)
 	case "edit":
 		return executeDelegatedEdit(ctx, a, req)
+	case markReadKind:
+		return executeDelegatedMarkRead(ctx, a, req)
+	case markReadThroughKind:
+		return executeDelegatedMarkRead(ctx, a, req)
+	case markReadReceiptsKind:
+		// Its own kind, so daemons without receipt support reject it here
+		// instead of marking the chat read and dropping the unread count.
+		req.Receipts = true
+		return executeDelegatedMarkRead(ctx, a, req)
+	case contactsCheckKind:
+		return executeDelegatedContactsCheck(ctx, a.WA(), req)
+	case chatStateKind:
+		return executeDelegatedChatState(ctx, a, req)
+	case contactsSaveKind:
+		return executeDelegatedContactsSave(ctx, a, req)
 	default:
 		return sendDelegateResponse{}, fmt.Errorf("unsupported send kind %q", req.Kind)
 	}
+}
+
+type delegatedMarkReadApp interface {
+	recipientResolverApp
+	MarkChatRead(context.Context, types.JID, bool) error
+	MarkChatReadThrough(context.Context, types.JID, string) error
+	MarkChatReadWithReceipts(context.Context, types.JID) (int, types.ReceiptType, error)
+	MarkChatReadWithReceiptsThrough(context.Context, types.JID, string) (int, types.ReceiptType, error)
+}
+
+func executeDelegatedMarkRead(ctx context.Context, a delegatedMarkReadApp, req sendDelegateRequest) (sendDelegateResponse, error) {
+	read := true
+	if req.Read != nil {
+		read = *req.Read
+	}
+	if req.Receipts && !read {
+		return sendDelegateResponse{}, fmt.Errorf("--receipts only applies to mark-read")
+	}
+	if req.Kind == markReadThroughKind {
+		if !read || strings.TrimSpace(req.ThroughMessageID) == "" || req.ThroughMessageID != strings.TrimSpace(req.ThroughMessageID) {
+			return sendDelegateResponse{}, fmt.Errorf("bounded mark-read requires an exact nonempty inbound message ID and read=true")
+		}
+	} else if req.ThroughMessageID != "" {
+		return sendDelegateResponse{}, fmt.Errorf("explicit read boundary requires send kind %q", markReadThroughKind)
+	}
+	toJID, err := resolveRecipient(a, req.To, recipientOptions{pick: req.Pick, asJSON: true})
+	if err != nil {
+		return sendDelegateResponse{}, err
+	}
+	// Receipt mode never enters app-state recovery.
+	var receipts *int
+	var receiptType string
+	if req.Receipts {
+		n, kind, err := markReadReceipts(ctx, a, toJID, req.ThroughMessageID)
+		if err != nil {
+			return sendDelegateResponse{}, err
+		}
+		receipts = &n
+		receiptType = string(kind)
+	} else {
+		var err error
+		if req.ThroughMessageID != "" {
+			err = a.MarkChatReadThrough(ctx, toJID, req.ThroughMessageID)
+		} else {
+			err = a.MarkChatRead(ctx, toJID, read)
+		}
+		if err != nil {
+			return sendDelegateResponse{}, err
+		}
+	}
+	action := "mark-read"
+	if !read {
+		action = "mark-unread"
+	}
+	return sendDelegateResponse{OK: true, Chat: toJID.String(), Action: action, Receipts: receipts, ReceiptType: receiptType}, nil
+}
+
+type delegatedChatStateApp interface {
+	recipientResolverApp
+	ArchiveChat(context.Context, types.JID, bool) error
+	PinChat(context.Context, types.JID, bool) error
+	MuteChat(context.Context, types.JID, bool, time.Duration) error
+}
+
+func executeDelegatedChatState(ctx context.Context, a delegatedChatStateApp, req sendDelegateRequest) (sendDelegateResponse, error) {
+	var run func(types.JID) error
+	switch req.ChatStateAction {
+	case "archive", "unarchive":
+		run = func(jid types.JID) error { return a.ArchiveChat(ctx, jid, req.ChatStateAction == "archive") }
+	case "pin", "unpin":
+		run = func(jid types.JID) error { return a.PinChat(ctx, jid, req.ChatStateAction == "pin") }
+	case "mute":
+		run = func(jid types.JID) error { return a.MuteChat(ctx, jid, true, millisDuration(req.MuteDurationMS, 0)) }
+	case "unmute":
+		run = func(jid types.JID) error { return a.MuteChat(ctx, jid, false, 0) }
+	default:
+		return sendDelegateResponse{}, fmt.Errorf("unsupported chat state action %q", req.ChatStateAction)
+	}
+	toJID, err := resolveRecipient(a, req.To, recipientOptions{pick: req.Pick, asJSON: true})
+	if err != nil {
+		return sendDelegateResponse{}, err
+	}
+	if err := run(toJID); err != nil {
+		return sendDelegateResponse{}, err
+	}
+	return sendDelegateResponse{OK: true, Chat: toJID.String(), Action: req.ChatStateAction}, nil
 }
 
 func executeDelegatedPresence(ctx context.Context, a *app.App, req sendDelegateRequest) (sendDelegateResponse, error) {
@@ -317,6 +531,25 @@ func executeDelegatedPresence(ctx context.Context, a *app.App, req sendDelegateR
 		return sendDelegateResponse{}, err
 	}
 	return sendDelegateResponse{OK: true, Sent: true, To: toJID.String()}, nil
+}
+
+type delegatedPresenceWatchApp interface {
+	WatchPresence(context.Context, types.JID, time.Duration) (*app.PresenceState, error)
+}
+
+func executeDelegatedPresenceSubscribe(ctx context.Context, a delegatedPresenceWatchApp, req sendDelegateRequest) (sendDelegateResponse, error) {
+	if req.PresenceWaitMS < 0 {
+		return sendDelegateResponse{}, fmt.Errorf("presence wait must be >= 0")
+	}
+	toJID, err := wa.ParseUserOrJID(req.To)
+	if err != nil {
+		return sendDelegateResponse{}, err
+	}
+	state, err := a.WatchPresence(ctx, toJID, time.Duration(req.PresenceWaitMS)*time.Millisecond)
+	if err != nil {
+		return sendDelegateResponse{}, err
+	}
+	return sendDelegateResponse{OK: true, To: toJID.String(), Presence: state}, nil
 }
 
 func executeDelegatedEdit(ctx context.Context, a *app.App, req sendDelegateRequest) (sendDelegateResponse, error) {
@@ -356,8 +589,10 @@ func executeDelegatedText(ctx context.Context, a *app.App, req sendDelegateReque
 	if err != nil {
 		return sendDelegateResponse{}, err
 	}
-	if err := validateTextRecipient(a.WA(), toJID); err != nil {
-		return sendDelegateResponse{}, err
+	if !req.AllowSelf {
+		if err := validateTextRecipient(a.WA(), toJID); err != nil {
+			return sendDelegateResponse{}, err
+		}
 	}
 	toJID = warmupDelegatedRecipient(ctx, a, toJID)
 	mentionedJIDs, err := parseMentionedJIDs(req.Mentions)
@@ -367,17 +602,14 @@ func executeDelegatedText(ctx context.Context, a *app.App, req sendDelegateReque
 	if err := warnRapidSendIfNeeded(a.StoreDir(), time.Now().UTC(), os.Stderr); err != nil {
 		return sendDelegateResponse{}, err
 	}
-	preview := fetchLinkPreview(ctx, req.Message, req.NoPreview)
-	msgID, err := runSendOperation(ctx, reconnectForSend(a), func(ctx context.Context) (types.MessageID, error) {
-		return sendTextMessage(ctx, a, toJID, req.Message, req.ReplyTo, req.ReplyToSender, preview, mentionedJIDs, ephemeral)
-	})
+	preview, previewWarning := fetchLinkPreview(ctx, req.Message, req.NoPreview)
+	var thumbnailWarning string
+	msgID, storeErr, err := sendTextWithHistory(ctx, a, reconnectForSend(a), toJID, req.Message, req.ReplyTo, req.ReplyToSender, preview, mentionedJIDs, ephemeral, textSendOptions{allowSelf: req.AllowSelf, warn: func(msg string) { thumbnailWarning = msg }})
 	if err != nil {
 		return sendDelegateResponse{}, err
 	}
-	now := time.Now().UTC()
-	storeErr := persistOutboundText(ctx, a, toJID, string(msgID), req.Message, now)
 	waitForPostSendRetryReceipts(ctx, millisDuration(req.PostSendWaitMS, 0))
-	resp := sendDelegateResponse{OK: true, Sent: true, To: toJID.String(), ID: string(msgID)}
+	resp := sendDelegateResponse{OK: true, Sent: true, To: toJID.String(), ID: string(msgID), PreviewWarning: previewWarning, ThumbWarning: thumbnailWarning}
 	if storeErr != nil {
 		resp.StoreWarning = storeErr.Error()
 	}
@@ -469,8 +701,7 @@ func executeDelegatedReact(ctx context.Context, a *app.App, req sendDelegateRequ
 		return sendDelegateResponse{}, err
 	}
 	now := time.Now().UTC()
-	chatName := a.WA().ResolveChatName(ctx, chat, "")
-	storeErr := upsertSentReaction(a.DB(), chat, chatName, sentID, req.ID, req.Reaction, now)
+	storeErr := upsertSentReaction(ctx, a.DB(), a.WA(), chat, sentID, req.ID, req.Reaction, now)
 	waitForPostSendRetryReceipts(ctx, millisDuration(req.PostSendWaitMS, 0))
 	resp := sendDelegateResponse{OK: true, Sent: true, To: chat.String(), ID: string(sentID), Target: req.ID, Reaction: req.Reaction}
 	if storeErr != nil {
@@ -480,6 +711,8 @@ func executeDelegatedReact(ctx context.Context, a *app.App, req sendDelegateRequ
 }
 
 func writeDelegatedSendOutput(flags *rootFlags, kind string, resp sendDelegateResponse) error {
+	warnLinkPreviewSkipped(os.Stderr, resp.PreviewWarning)
+	warnLinkPreviewThumbnail(os.Stderr, resp.ThumbWarning)
 	warnSendStoreFailureMsg(os.Stderr, resp.ID, resp.StoreWarning)
 	if flags.asJSON {
 		body := map[string]any{"sent": resp.Sent, "to": resp.To, "id": resp.ID}

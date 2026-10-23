@@ -9,10 +9,12 @@ import (
 	_ "github.com/mattn/go-sqlite3"
 	"github.com/openclaw/wacli/internal/sqliteutil"
 	"go.mau.fi/whatsmeow"
+	"go.mau.fi/whatsmeow/store"
 	"go.mau.fi/whatsmeow/store/sqlstore"
+	"go.mau.fi/whatsmeow/types/events"
 )
 
-func (c *Client) init() error {
+func (c *Client) init() (err error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -25,6 +27,11 @@ func (c *Client) init() error {
 	if err != nil {
 		return fmt.Errorf("open whatsmeow store: %w", err)
 	}
+	defer func() {
+		if err != nil {
+			_ = container.Close()
+		}
+	}()
 	if err := sqliteutil.ChmodFiles(c.opts.StorePath, 0o600); err != nil {
 		return err
 	}
@@ -38,6 +45,10 @@ func (c *Client) init() error {
 		}
 	}
 
+	// Journal the contact store writes before the client exists, so every
+	// name whatsmeow stores while applying critical_unblock_low is recorded
+	// in application order (see ContactStoreJournal).
+	c.contactJournal = journalContactStore(deviceStore)
 	logger := newWhatsmeowLogger("Client", "ERROR", os.Stderr)
 	c.client = whatsmeow.NewClient(deviceStore, logger)
 	// FetchAppStateEvents fails closed without this: recovery snapshots must
@@ -49,5 +60,46 @@ func (c *Client) init() error {
 	// "Waiting for this message" indefinitely because whatsmeow can't find the
 	// original plaintext to re-encrypt when the retry arrives.
 	c.client.UseRetryMessageStore = true
+	cli := c.client
+	onEmptyKey := func(keyID []byte) {
+		cli.DangerousInternals().DispatchEvent(&AppStateKeyUnavailable{KeyID: keyID})
+	}
+	guardAppStateKeys(deviceStore, c.opts.KeyStateStore, onEmptyKey)
+	cli.AddEventHandler(func(evt any) {
+		if _, ok := evt.(*events.PairSuccess); ok {
+			guardAppStateKeys(cli.Store, c.opts.KeyStateStore, onEmptyKey)
+			// Pairing's Device.Save replaced the stores. whatsmeow dispatches
+			// PairSuccess right after it answered the pairing request; the
+			// server then closes the stream, and app state is only fetched
+			// after the reconnect and login that follow, so nothing writes
+			// cli.Store.Contacts while it is rewrapped here.
+			journal := journalContactStore(cli.Store)
+			c.mu.Lock()
+			c.contactJournal = journal
+			c.mu.Unlock()
+		}
+	})
+	// Let whatsmeow own bounded primary-device retries and cancellation for
+	// eligible decryption failures.
+	c.client.AutomaticMessageRerequestFromPhone = true
+	c.container = container
 	return nil
+}
+
+// journalContactStore wraps the device's contact store in a
+// ContactStoreJournal, and its app-state store so the journal also records
+// the collection cursor writes, once, and returns the journal.
+func journalContactStore(device *store.Device) *ContactStoreJournal {
+	if device == nil || device.Contacts == nil {
+		return nil
+	}
+	if journal, ok := device.Contacts.(*ContactStoreJournal); ok {
+		return journal
+	}
+	journal := NewContactStoreJournal(device.Contacts)
+	device.Contacts = journal
+	if device.AppState != nil {
+		device.AppState = journal.AppStateStore(device.AppState)
+	}
+	return journal
 }

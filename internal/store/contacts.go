@@ -115,6 +115,23 @@ func (d *DB) ListTags(jid string) ([]string, error) {
 	return d.q.ListTags(storeCtx(), jid)
 }
 
+func (d *DB) ListContactAliases() (map[string]string, error) {
+	rows, err := d.sql.Query("SELECT jid, alias FROM contact_aliases")
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	aliases := make(map[string]string)
+	for rows.Next() {
+		var jid, alias string
+		if err := rows.Scan(&jid, &alias); err != nil {
+			return nil, err
+		}
+		aliases[jid] = alias
+	}
+	return aliases, rows.Err()
+}
+
 func (d *DB) UpsertContact(jid, phone, pushName, fullName, firstName, businessName string) error {
 	return d.q.UpsertContact(storeCtx(), storedb.UpsertContactParams{
 		Jid:          jid,
@@ -127,28 +144,101 @@ func (d *DB) UpsertContact(jid, phone, pushName, fullName, firstName, businessNa
 	})
 }
 
-func (d *DB) SetAlias(jid, alias string) error {
+// ContactActionName is the pair of names a `contact` app-state action
+// carries for one contact, keyed as wacli.db stores it.
+type ContactActionName struct {
+	JID, Phone, FullName, FirstName string
+}
+
+// SetContactActionNames stores, in one transaction and in order, the names
+// carried by WhatsApp `contact` app-state actions. Unlike UpsertContact, an
+// action is authoritative for full_name and first_name, so an absent name
+// clears the column, matching whatsmeow's PutContactName for the session
+// store. Push, business, and system names are left alone. An action with no
+// names only clears an existing row; it never creates one.
+func (d *DB) SetContactActionNames(names []ContactActionName) error {
+	if len(names) == 0 {
+		return nil
+	}
+	tx, err := d.sql.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	q := d.q.WithTx(tx)
+	now := nowUTC().Unix()
+	for _, name := range names {
+		if err := setContactActionName(q, name, now); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
+func setContactActionName(q *storedb.Queries, name ContactActionName, now int64) error {
+	if name.FullName == "" && name.FirstName == "" {
+		return q.ClearContactActionName(storeCtx(), storedb.ClearContactActionNameParams{
+			UpdatedAt: now,
+			Jid:       name.JID,
+		})
+	}
+	return q.SetContactActionName(storeCtx(), storedb.SetContactActionNameParams{
+		Jid:       name.JID,
+		Phone:     nullString(name.Phone),
+		FullName:  nullString(name.FullName),
+		FirstName: nullString(name.FirstName),
+		UpdatedAt: now,
+	})
+}
+
+func (d *DB) SetAlias(jids []string, alias string) error {
 	alias = strings.TrimSpace(alias)
 	if alias == "" {
 		return fmt.Errorf("alias is required")
 	}
-	return d.q.SetAlias(storeCtx(), storedb.SetAliasParams{Jid: jid, Alias: alias, UpdatedAt: nowUTC().Unix()})
+	return d.updateContactMetadata(jids, func(q *storedb.Queries, jid string) error {
+		return q.SetAlias(storeCtx(), storedb.SetAliasParams{Jid: jid, Alias: alias, UpdatedAt: nowUTC().Unix()})
+	})
 }
 
-func (d *DB) RemoveAlias(jid string) error {
-	return d.q.RemoveAlias(storeCtx(), jid)
+func (d *DB) RemoveAlias(jids []string) error {
+	return d.updateContactMetadata(jids, func(q *storedb.Queries, jid string) error {
+		return q.RemoveAlias(storeCtx(), jid)
+	})
 }
 
-func (d *DB) AddTag(jid, tag string) error {
+func (d *DB) AddTag(jids []string, tag string) error {
 	tag = strings.TrimSpace(tag)
 	if tag == "" {
 		return fmt.Errorf("tag is required")
 	}
-	return d.q.AddTag(storeCtx(), storedb.AddTagParams{Jid: jid, Tag: tag, UpdatedAt: nowUTC().Unix()})
+	return d.updateContactMetadata(jids, func(q *storedb.Queries, jid string) error {
+		return q.AddTag(storeCtx(), storedb.AddTagParams{Jid: jid, Tag: tag, UpdatedAt: nowUTC().Unix()})
+	})
 }
 
-func (d *DB) RemoveTag(jid, tag string) error {
-	return d.q.RemoveTag(storeCtx(), storedb.RemoveTagParams{Jid: jid, Tag: tag})
+func (d *DB) RemoveTag(jids []string, tag string) error {
+	return d.updateContactMetadata(jids, func(q *storedb.Queries, jid string) error {
+		return q.RemoveTag(storeCtx(), storedb.RemoveTagParams{Jid: jid, Tag: tag})
+	})
+}
+
+func (d *DB) updateContactMetadata(jids []string, update func(*storedb.Queries, string) error) error {
+	if len(jids) == 0 {
+		return fmt.Errorf("at least one contact JID is required")
+	}
+	tx, err := d.sql.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	q := d.q.WithTx(tx)
+	for _, jid := range jids {
+		if err := update(q, jid); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
 }
 
 func contactFromListRow(row storedb.ListContactsRow) Contact {

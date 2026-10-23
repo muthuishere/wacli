@@ -32,8 +32,10 @@ func parseLockOwnerPID(lockInfo string) int {
 	return 0
 }
 
-func doctorConnectionState(authed, connected, lockHeld, connect bool) string {
+func doctorConnectionState(authed, connected, lockHeld, connect, sessionRevoked bool) string {
 	switch {
+	case sessionRevoked:
+		return "logged_out"
 	case connected:
 		return "connected"
 	case authed && lockHeld && !connect:
@@ -81,6 +83,7 @@ type doctorReport struct {
 	LockInfo        string            `json:"lock_info,omitempty"`
 	LockOwnerPID    int               `json:"lock_owner_pid,omitempty"`
 	Authed          bool              `json:"authenticated"`
+	SessionRevoked  bool              `json:"session_revoked"`
 	LinkedJID       string            `json:"linked_jid,omitempty"`
 	Connected       bool              `json:"connected"`
 	ConnectionState string            `json:"connection_state"`
@@ -97,9 +100,7 @@ func doctorStoreStatsFromStoreStats(stats store.StoreStats) doctorStoreStats {
 		Contacts:   stats.Contacts,
 		Groups:     stats.Groups,
 	}
-	if stats.LastMessageTS > 0 {
-		out.LastSyncAt = time.Unix(stats.LastMessageTS, 0).UTC().Format(time.RFC3339)
-	}
+
 	return out
 }
 
@@ -114,6 +115,7 @@ func writeDoctorReport(w io.Writer, rep doctorReport) {
 		fmt.Fprintf(tw, "LOCK_OWNER_PID\t%d\n", rep.LockOwnerPID)
 	}
 	fmt.Fprintf(tw, "AUTHENTICATED\t%v\n", rep.Authed)
+	fmt.Fprintf(tw, "SESSION_REVOKED\t%v\n", rep.SessionRevoked)
 	if rep.LinkedJID != "" {
 		fmt.Fprintf(tw, "LINKED_JID\t%s\n", sanitize(rep.LinkedJID))
 	}
@@ -222,6 +224,15 @@ func newDoctorCmd(flags *rootFlags) *cobra.Command {
 					}
 				}
 			}
+			sessionRevoked, sessionStateErr := appPkg.SessionRevoked(storeDir)
+			if sessionStateErr != nil && storeErr == "" {
+				storeErr = sessionStateErr.Error()
+			}
+			if sessionRevoked {
+				authed = false
+				connected = false
+				linkedJID = ""
+			}
 			lockOwnerPID := parseLockOwnerPID(lockInfo)
 
 			var stats *doctorStoreStats
@@ -233,6 +244,11 @@ func newDoctorCmd(flags *rootFlags) *cobra.Command {
 				if raw, err := db.Stats(); err == nil {
 					converted := doctorStoreStatsFromStoreStats(raw)
 					stats = &converted
+					if synced, err := db.LastSuccessfulSync(); err != nil {
+						storeErr = err.Error()
+					} else if synced != nil {
+						stats.LastSyncAt = synced.UTC().Format(time.RFC3339)
+					}
 				} else if storeErr == "" {
 					storeErr = err.Error()
 				}
@@ -250,9 +266,10 @@ func newDoctorCmd(flags *rootFlags) *cobra.Command {
 				LockInfo:        lockInfo,
 				LockOwnerPID:    lockOwnerPID,
 				Authed:          authed,
+				SessionRevoked:  sessionRevoked,
 				LinkedJID:       linkedJID,
 				Connected:       connected,
-				ConnectionState: doctorConnectionState(authed, connected, lockHeld, connect),
+				ConnectionState: doctorConnectionState(authed, connected, lockHeld, connect, sessionRevoked),
 				FTSEnabled:      db != nil && db.HasFTS(),
 				Store:           stats,
 				StoreError:      storeErr,

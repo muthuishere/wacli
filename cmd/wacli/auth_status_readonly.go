@@ -8,11 +8,19 @@ import (
 	"path/filepath"
 	"strings"
 
+	appPkg "github.com/openclaw/wacli/internal/app"
 	"github.com/openclaw/wacli/internal/sqliteutil"
 	"go.mau.fi/whatsmeow/types"
 )
 
 func readOnlyAuthStatus(storeDir string) (bool, string, error) {
+	revoked, err := appPkg.SessionRevoked(storeDir)
+	if err != nil {
+		return false, "", err
+	}
+	if revoked {
+		return false, "", nil
+	}
 	sessionPath := filepath.Join(storeDir, "session.db")
 	if _, err := os.Stat(sessionPath); err != nil {
 		if errors.Is(err, os.ErrNotExist) {
@@ -50,7 +58,7 @@ func readOnlyAuthStatus(storeDir string) (bool, string, error) {
 }
 
 func readOnlySessionSQLiteURI(path string) string {
-	params := "mode=ro&_query_only=1&_busy_timeout=5000"
+	params := "mode=ro&_query_only=1&readonly_shm=1&_busy_timeout=5000"
 	if !sqliteSessionSidecarsExist(path) {
 		params += "&immutable=1"
 	}

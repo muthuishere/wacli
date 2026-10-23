@@ -9,6 +9,58 @@ import (
 	"github.com/openclaw/wacli/internal/store"
 )
 
+func TestMediaEnqueuerBackpressure(t *testing.T) {
+	for _, cancelBlocked := range []bool{false, true} {
+		name := "capacity"
+		if cancelBlocked {
+			name = "cancellation"
+		}
+		t.Run(name, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			queue := newMediaQueue(1)
+			enqueue := newMediaEnqueuer(ctx, queue)
+			enqueue("chat", "first")
+
+			started, returned := make(chan struct{}), make(chan struct{})
+			go func() {
+				close(started)
+				enqueue("chat", "second")
+				close(returned)
+			}()
+			<-started
+			// A full queue must block its caller, not spawn an unbounded
+			// enqueue goroutine. Process-wide counts include unrelated work.
+			select {
+			case <-returned:
+				t.Fatal("enqueue returned while the media queue was full")
+			case <-time.After(50 * time.Millisecond):
+			}
+			if cancelBlocked {
+				cancel()
+			} else {
+				first := <-queue.jobs
+				queue.done()
+				if first.msgID != "first" {
+					t.Fatalf("first job = %q", first.msgID)
+				}
+			}
+			select {
+			case <-returned:
+			case <-time.After(time.Second):
+				t.Fatal("enqueue stayed blocked after capacity or cancellation")
+			}
+			if !cancelBlocked {
+				second := <-queue.jobs
+				queue.done()
+				if second.msgID != "second" {
+					t.Fatalf("second job = %q", second.msgID)
+				}
+			}
+		})
+	}
+}
+
 func TestMediaQueueWaitIdleFencesActiveProducer(t *testing.T) {
 	queue := newMediaQueue(1)
 	if !queue.beginProducer() {

@@ -45,6 +45,11 @@ func newSendStatusCmd(flags *rootFlags) *cobra.Command {
 			if err := flags.requireWritable(); err != nil {
 				return err
 			}
+			if filePath != "" {
+				if err := checkOutboundMediaPath(filePath); err != nil {
+					return err
+				}
+			}
 			if cmd.Flags().Changed("font") {
 				fontSet = true
 			}
@@ -69,7 +74,7 @@ func newSendStatusCmd(flags *rootFlags) *cobra.Command {
 			}
 			defer closeApp(a, lk)
 
-			if err := a.EnsureAuthed(); err != nil {
+			if err := a.EnsureAuthed(ctx); err != nil {
 				return err
 			}
 			if err := a.Connect(ctx, false, nil); err != nil {

@@ -2,7 +2,7 @@
 
 Read when: preparing or verifying an official wacli release.
 
-wacli uses the fleet-standard reusable Go CLI workflow from `openclaw/release-workflows@v1`. The repository wrapper is intentionally thin: it supplies the wacli artifact contract and maps repository secrets, while the shared workflow owns source freezing, the annotated tag, builds, signing, notarization, independent verification, publication, Homebrew handoff, and the next-version closeout PR.
+wacli uses the fleet-standard reusable Go CLI workflow from `openclaw/release-workflows@v1`. The repository wrapper is intentionally thin: it supplies the wacli artifact contract and maps repository secrets, while the shared workflow owns source freezing, the annotated tag, builds, signing, notarization, independent verification, publication, Homebrew handoff, and changelog closeout.
 
 ## Release contract
 
@@ -11,16 +11,21 @@ wacli uses the fleet-standard reusable Go CLI workflow from `openclaw/release-wo
 - The canonical GoReleaser config builds the Darwin CGO binaries on macOS.
 - `.goreleaser-linux-windows.yaml` builds Linux amd64/arm64 and Windows amd64 with the fixed cross-compilers supplied by the shared workflow.
 - `LICENSE` and `README.md` are preserved in every archive, and the published checksum asset remains `checksums.txt`.
+- Official Darwin archives target macOS 15.0 (Sequoia) or newer on both architectures; verify `LC_BUILD_VERSION` for each published binary.
+- The Darwin GoReleaser post-build hook checks each Mach-O slice with `otool` and rejects any minimum other than macOS 15.0 before signing or publication. Recheck downloaded binaries with `bash scripts/check-macos-minimum.sh <binary>`.
 - Every Darwin binary retains the established `org.openclaw.wacli` identifier and OpenClaw Foundation Developer ID identity.
 - The independent rebuild must reproduce every staged Linux and Windows binary byte-for-byte before publication.
-- The published release must hand off exact verified assets to `openclaw/homebrew-tap`, then open the next patch's `Unreleased` closeout PR.
+- Build and verification use the exact preferred `toolchain` from the frozen commit's `go.mod` (currently Go 1.27.3); the `go` directive remains the Go 1.27.0 source minimum. Historical commits without a `toolchain` directive use their exact `go` version.
+- The published release must hand off exact verified assets to `openclaw/homebrew-tap`. Keep an empty `Unreleased` section above the dated release notes; if that section is absent, the workflow opens a closeout PR to restore it. Closeout does not bump the source version.
 
 ## Dispatch
 
 ```bash
-gh workflow run release.yml --repo openclaw/wacli --ref main -f version=0.15.1
+gh workflow run release.yml --repo openclaw/wacli --ref main -f version=0.20.0
 ```
 
-Watch the exact run through completion. A successful run is not sufficient on its own: verify the public release is non-draft and non-prerelease, its tag peels to the frozen protected-main commit, every expected asset is present, `checksums.txt` validates the downloaded assets, both native macOS verifier jobs passed, the Homebrew update run succeeded, and the closeout PR was opened.
+Watch the exact run through completion. A successful run is not sufficient on its own: verify the public release is non-draft and non-prerelease, its tag peels to the frozen protected-main commit, every expected asset is present, `checksums.txt` validates the downloaded assets, both native macOS verifier jobs passed, the Homebrew update run succeeded, and the empty `Unreleased` section is present. If a closeout PR was needed, merge it after its checks pass.
 
 Retries reuse the immutable annotated version tag and its frozen commit. Never move or replace a consumer release tag to recover from a failed run; fix the shared workflow or caller on `main`, then dispatch the same version again.
+
+For a nonpublishing verification after dependency or toolchain updates, dispatch Release on `main` with the current version and `dry_run=true`. The shared workflow builds and verifies artifacts without creating tags or releases.

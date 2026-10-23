@@ -5,6 +5,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/openclaw/wacli/internal/lock"
 	"github.com/spf13/cobra"
 )
 
@@ -40,6 +41,21 @@ func TestParseMediaRetryBefore(t *testing.T) {
 	}
 }
 
+func TestParseMediaRetryType(t *testing.T) {
+	for in, want := range map[string]string{"": "", " Audio ": "audio", "sticker": "sticker", "gif": "gif"} {
+		got, err := parseMediaRetryType(in)
+		if err != nil || got != want {
+			t.Fatalf("parseMediaRetryType(%q) = %q, %v; want %q", in, got, err, want)
+		}
+	}
+	// Types the store never records for downloadable media are typos here.
+	for _, in := range []string{"voice", "ptt", "location", "images"} {
+		if _, err := parseMediaRetryType(in); err == nil {
+			t.Fatalf("parseMediaRetryType(%q) accepted an unknown type", in)
+		}
+	}
+}
+
 func TestMediaRetryRejectsInvalidOptionsBeforeStoreAccess(t *testing.T) {
 	for _, tc := range []struct {
 		name string
@@ -50,6 +66,7 @@ func TestMediaRetryRejectsInvalidOptionsBeforeStoreAccess(t *testing.T) {
 		{name: "batch", args: []string{"--batch", "0"}, want: "--batch must be > 0"},
 		{name: "wait", args: []string{"--wait", "0"}, want: "--wait must be > 0"},
 		{name: "before", args: []string{"--before", "01-02-2026"}, want: "--before must be YYYY-MM-DD"},
+		{name: "type", args: []string{"--type", "voice"}, want: `invalid --type "voice"`},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			args := append([]string{"--account", "does-not-exist", "media", "retry"}, tc.args...)
@@ -65,5 +82,40 @@ func TestMediaDownloadReadOnlyRequiresOutput(t *testing.T) {
 	err := execute([]string{"--read-only", "media", "download", "--chat", "chat@s.whatsapp.net", "--id", "mid"})
 	if err == nil || !strings.Contains(err.Error(), "--output is required in read-only mode") {
 		t.Fatalf("execute error = %v, want read-only output requirement", err)
+	}
+}
+
+// `sync --follow` holds the store lock for its entire run, so waiting cannot
+// clear it and the caller has to be told about the path that needs no lock.
+func TestMediaDownloadLockedStoreNamesTheReadOnlyPath(t *testing.T) {
+	storeDir := t.TempDir()
+	lk, err := lock.Acquire(storeDir)
+	if err != nil {
+		t.Fatalf("lock store: %v", err)
+	}
+	defer lk.Release()
+
+	err = execute([]string{"--store", storeDir, "media", "download",
+		"--chat", "15551234567@s.whatsapp.net", "--id", "mid"})
+	if err == nil {
+		t.Fatal("media download unexpectedly succeeded against a locked store")
+	}
+	if !strings.Contains(err.Error(), "store is locked") {
+		t.Fatalf("error = %v, want the original lock error preserved", err)
+	}
+	if !strings.Contains(err.Error(), "--read-only") {
+		t.Fatalf("error = %v, want it to name --read-only", err)
+	}
+}
+
+// The hint belongs to the lock case only: an unrelated failure must not be
+// dressed up as one.
+func TestMediaDownloadReadOnlyLockHintIsNotAddedToOtherErrors(t *testing.T) {
+	err := execute([]string{"--store", t.TempDir(), "media", "download", "--chat", "", "--id", ""})
+	if err == nil {
+		t.Fatal("expected missing-argument failure")
+	}
+	if strings.Contains(err.Error(), "--read-only") {
+		t.Fatalf("error = %v, want no lock hint on an argument error", err)
 	}
 }

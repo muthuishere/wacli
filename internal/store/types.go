@@ -36,10 +36,10 @@ type Group struct {
 }
 
 type GroupParticipant struct {
-	GroupJID  string
-	UserJID   string
-	Role      string
-	UpdatedAt time.Time
+	GroupJID  string    `json:"group_jid"`
+	UserJID   string    `json:"user_jid"`
+	Role      string    `json:"role"`
+	UpdatedAt time.Time `json:"updated_at"`
 }
 
 type MediaDownloadInfo struct {
@@ -70,6 +70,7 @@ type Button struct {
 }
 
 type Message struct {
+	rank            float64
 	ChatJID         string
 	ChatName        string
 	MsgID           string
@@ -101,8 +102,13 @@ type Message struct {
 	DeletedAt       *time.Time `json:"deleted_at,omitempty"`
 	DeletionReason  string     `json:"deletion_reason,omitempty"`
 	PayloadPurgedAt *time.Time `json:"payload_purged_at,omitempty"`
-	Snippet         string
-	rowID           int64
+	// How many recipients reported the message delivered, and how many of those
+	// went on to read it. Both stay 0 for a message nobody reported on, which
+	// includes every message stored before receipts were kept.
+	DeliveredTo int
+	ReadBy      int
+	Snippet     string
+	rowID       int64
 }
 
 type MessageInfo struct {
@@ -176,7 +182,7 @@ func boolToInt64(b bool) int64 {
 	return 0
 }
 
-func nullIfEmpty(s string) interface{} {
+func nullIfEmpty(s string) any {
 	s = strings.TrimSpace(s)
 	if s == "" {
 		return nil

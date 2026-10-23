@@ -29,6 +29,19 @@ func (s *appStatePersistenceSequencer) reserveLive() uint64 {
 	return s.reserveTask(true)
 }
 
+func (s *appStatePersistenceSequencer) reserveAfterPending() (uint64, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.initLocked()
+	if s.serving == s.next {
+		return 0, false
+	}
+	ticket := s.next
+	s.next++
+	s.tasks[ticket] = &appStatePersistenceTask{blocksEarlier: true}
+	return ticket, true
+}
+
 func (s *appStatePersistenceSequencer) reserveTask(blocksEarlier bool) uint64 {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -36,23 +49,6 @@ func (s *appStatePersistenceSequencer) reserveTask(blocksEarlier bool) uint64 {
 	ticket := s.next
 	s.next++
 	s.tasks[ticket] = &appStatePersistenceTask{blocksEarlier: blocksEarlier}
-	return ticket
-}
-
-func (s *appStatePersistenceSequencer) enqueue(run func()) uint64 {
-	s.mu.Lock()
-	s.initLocked()
-	ticket := s.next
-	s.next++
-	s.tasks[ticket] = &appStatePersistenceTask{ready: true, run: run}
-	start := !s.running && ticket == s.serving
-	if start {
-		s.running = true
-	}
-	s.mu.Unlock()
-	if start {
-		s.drainThrough(ticket)
-	}
 	return ticket
 }
 

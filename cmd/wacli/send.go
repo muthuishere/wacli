@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"strconv"
 	"strings"
@@ -46,6 +47,7 @@ func newSendTextCmd(flags *rootFlags) *cobra.Command {
 	var replyTo string
 	var replyToSender string
 	var noPreview bool
+	var allowSelf bool
 	var ephemeral bool
 	var ephemeralDuration string
 	var messageEscapes bool
@@ -91,6 +93,7 @@ func newSendTextCmd(flags *rootFlags) *cobra.Command {
 					ReplyTo:              replyTo,
 					ReplyToSender:        replyToSender,
 					NoPreview:            noPreview,
+					AllowSelf:            allowSelf,
 					Ephemeral:            ephemeralOpts.Enabled,
 					EphemeralDuration:    ephemeralOpts.Duration,
 					EphemeralDurationSet: ephemeralOpts.DurationSet,
@@ -106,7 +109,7 @@ func newSendTextCmd(flags *rootFlags) *cobra.Command {
 			}
 			defer closeApp(a, lk)
 
-			if err := a.EnsureAuthed(); err != nil {
+			if err := a.EnsureAuthed(ctx); err != nil {
 				return err
 			}
 
@@ -114,8 +117,10 @@ func newSendTextCmd(flags *rootFlags) *cobra.Command {
 			if err != nil {
 				return err
 			}
-			if err := validateTextRecipient(a.WA(), toJID); err != nil {
-				return err
+			if !allowSelf {
+				if err := validateTextRecipient(a.WA(), toJID); err != nil {
+					return err
+				}
 			}
 			mentionedJIDs, err := parseMentionedJIDs(mentions)
 			if err != nil {
@@ -129,17 +134,13 @@ func newSendTextCmd(flags *rootFlags) *cobra.Command {
 				return err
 			}
 
-			preview := fetchLinkPreview(ctx, message, noPreview)
-			msgID, err := runSendOperation(ctx, reconnectForSend(a), func(ctx context.Context) (types.MessageID, error) {
-				return sendTextMessage(ctx, a, toJID, message, replyTo, replyToSender, preview, mentionedJIDs, ephemeralOpts)
-			})
+			preview, previewWarning := fetchLinkPreview(ctx, message, noPreview)
+			msgID, storeErr, err := sendTextWithHistory(ctx, a, reconnectForSend(a), toJID, message, replyTo, replyToSender, preview, mentionedJIDs, ephemeralOpts, textSendOptions{allowSelf: allowSelf, warn: func(msg string) { warnLinkPreviewThumbnail(os.Stderr, msg) }})
 			if err != nil {
 				return err
 			}
-
-			now := time.Now().UTC()
+			warnLinkPreviewSkipped(os.Stderr, previewWarning)
 			chat := toJID
-			storeErr := persistOutboundText(ctx, a, chat, string(msgID), message, now)
 			warnSendStoreFailure(os.Stderr, string(msgID), storeErr)
 
 			waitForPostSendRetryReceipts(ctx, postSendWait)
@@ -163,15 +164,12 @@ func newSendTextCmd(flags *rootFlags) *cobra.Command {
 	cmd.Flags().StringVar(&replyTo, "reply-to", "", "message ID to quote/reply to")
 	cmd.Flags().StringVar(&replyToSender, "reply-to-sender", "", "sender JID of the quoted message (required for unsynced group replies)")
 	cmd.Flags().BoolVar(&noPreview, "no-preview", false, "disable automatic link previews for the first URL in text")
+	cmd.Flags().BoolVar(&allowSelf, "allow-self", false, "allow sending to the linked account itself (delivery is not guaranteed)")
 	cmd.Flags().BoolVar(&ephemeral, "ephemeral", false, "send with the disappearing-message timer for this chat")
 	cmd.Flags().StringVar(&ephemeralDuration, "ephemeral-duration", "", "disappearing-message timer override (for example 24h, 7d, 90d, 168h)")
 	cmd.Flags().BoolVar(&messageEscapes, "message-escapes", false, `interpret backslash escapes in --message (\n, \r, \t, \\, \")`)
 	cmd.Flags().DurationVar(&postSendWait, "post-send-wait", postSendRetryReceiptWait, "keep the connection alive after send so retry receipts can be handled (0 disables)")
 	return cmd
-}
-
-func persistOutboundText(ctx context.Context, a *app.App, chat types.JID, msgID, text string, now time.Time) error {
-	return persistOutboundTextWith(ctx, a.DB(), a.WA(), chat, msgID, text, now)
 }
 
 type outboundTextResolver interface {
@@ -187,22 +185,62 @@ func canonicalOutboundChat(ctx context.Context, resolver outboundTextResolver, c
 	return chat
 }
 
-func persistOutboundTextWith(ctx context.Context, db *store.DB, resolver outboundTextResolver, chat types.JID, msgID, text string, now time.Time) error {
+// Immediate history follows sync's canonical sender contract. Resolve only
+// the stored identity; the native context still describes the wire quote.
+func canonicalOutboundQuoteSender(ctx context.Context, resolver outboundTextResolver, raw string) string {
+	if raw == "" {
+		return ""
+	}
+	jid, err := types.ParseJID(raw)
+	if err != nil {
+		return raw
+	}
+	if jid.Server == types.HiddenUserServer {
+		jid = canonicalOutboundChat(ctx, resolver, jid)
+	} else if jid.Server == types.DefaultUserServer {
+		jid = jid.ToNonAD()
+	}
+	return jid.String()
+}
+
+func outboundTextDisplayText(text string, quote *waProto.ContextInfo) string {
+	base := strings.TrimSpace(text)
+	if base == "" {
+		base = "(message)"
+	}
+	if quote == nil || strings.TrimSpace(quote.GetStanzaID()) == "" {
+		return base
+	}
+	quoted := strings.TrimSpace(wa.MessageDisplayText(quote.GetQuotedMessage()))
+	if quoted == "" {
+		quoted = "message"
+	}
+	return fmt.Sprintf("> %s\n%s", quoted, base)
+}
+
+func persistOutboundTextWith(ctx context.Context, db *store.DB, resolver outboundTextResolver, chat types.JID, msgID, text string, now time.Time, contexts ...*waProto.ContextInfo) error {
 	chat = canonicalOutboundChat(ctx, resolver, chat)
+	var quote *waProto.ContextInfo
+	if len(contexts) > 0 {
+		quote = contexts[0]
+	}
 	chatName := resolver.ResolveChatName(ctx, chat, "")
 	var storeErr error
 	if err := db.UpsertChat(chat.String(), chatKindFromJID(chat), chatName, now); err != nil {
 		storeErr = fmt.Errorf("chat update: %w", err)
 	}
 	if err := db.UpsertMessage(store.UpsertMessageParams{
-		ChatJID:    chat.String(),
-		ChatName:   chatName,
-		MsgID:      msgID,
-		SenderJID:  "",
-		SenderName: "me",
-		Timestamp:  now,
-		FromMe:     true,
-		Text:       text,
+		ChatJID:         chat.String(),
+		ChatName:        chatName,
+		MsgID:           msgID,
+		SenderJID:       "",
+		SenderName:      "me",
+		Timestamp:       now,
+		FromMe:          true,
+		Text:            text,
+		DisplayText:     outboundTextDisplayText(text, quote),
+		QuotedMsgID:     quote.GetStanzaID(),
+		QuotedSenderJID: canonicalOutboundQuoteSender(ctx, resolver, quote.GetParticipant()),
 	}); err != nil {
 		storeErr = errors.Join(storeErr, fmt.Errorf("message update: %w", err))
 	}
@@ -230,6 +268,17 @@ type textEphemeralOptions struct {
 	DurationSet bool
 }
 
+type textSendOptions struct {
+	allowSelf bool
+	// Capture the context constructed for the accepted native message. History
+	// must not reconstruct its participant from flags or a second store lookup.
+	replyContext **waProto.ContextInfo
+	// warn receives non-fatal send warnings (such as a failed HQ link preview
+	// thumbnail upload) so the output-owning caller can render them. Nil drops
+	// them.
+	warn func(string)
+}
+
 type resolvedTextEphemeral struct {
 	enabled       bool
 	hasExpiration bool
@@ -240,25 +289,26 @@ const defaultEphemeralExpiration uint32 = 7 * 24 * 60 * 60
 
 var errSelfTextRecipient = errors.New("send text to the linked account itself is not supported: WhatsApp can acknowledge self-messages without delivering them; use the official Message Yourself chat")
 
-func sendTextMessage(ctx context.Context, a sendTextApp, to types.JID, text, replyTo, replyToSender string, preview *linkpreview.Preview, mentionedJIDs []string, ephemeral textEphemeralOptions) (types.MessageID, error) {
-	return sendTextMessageWithSender(ctx, a.WA(), a.DB(), to, text, replyTo, replyToSender, preview, mentionedJIDs, ephemeral)
+func sendTextMessage(ctx context.Context, a sendTextApp, to types.JID, text, replyTo, replyToSender string, preview *linkpreview.Preview, mentionedJIDs []string, ephemeral textEphemeralOptions, options textSendOptions) (types.MessageID, error) {
+	return sendTextMessageWithSender(ctx, a.WA(), a.DB(), to, text, replyTo, replyToSender, preview, mentionedJIDs, ephemeral, options)
 }
 
-func sendTextMessageWithSender(ctx context.Context, sender textMessageSender, db *store.DB, to types.JID, text, replyTo, replyToSender string, preview *linkpreview.Preview, mentionedJIDs []string, ephemeral textEphemeralOptions) (types.MessageID, error) {
-	if err := validateTextRecipient(sender, to); err != nil {
-		return "", err
+func sendTextMessageWithSender(ctx context.Context, sender textMessageSender, db *store.DB, to types.JID, text, replyTo, replyToSender string, preview *linkpreview.Preview, mentionedJIDs []string, ephemeral textEphemeralOptions, options textSendOptions) (types.MessageID, error) {
+	if !options.allowSelf {
+		if err := validateTextRecipient(sender, to); err != nil {
+			return "", err
+		}
 	}
-	var aliasTo types.JID
-	if strings.TrimSpace(replyTo) != "" {
-		aliasTo = replyLookupAlias(ctx, sender, to)
-	}
-	selfJID, err := textReplySelfJID(ctx, sender, db, to, aliasTo, replyTo, replyToSender)
+	reply, err := buildReplyContextInfo(ctx, sender, db, to, replyTo, replyToSender)
 	if err != nil {
 		return "", err
 	}
-	msg, plainText, err := buildTextMessageWithSelf(db, to, aliasTo, text, replyTo, replyToSender, selfJID, preview, mentionedJIDs)
-	if err != nil {
-		return "", err
+	msg, plainText := buildTextMessage(text, reply, preview, mentionedJIDs)
+	if preview != nil && len(preview.Thumbnail) > 0 && !plainText {
+		up, _ := sender.(linkPreviewUploader)
+		if warning := applyLinkPreviewImage(ctx, up, msg.GetExtendedTextMessage(), preview.Thumbnail); warning != "" && options.warn != nil {
+			options.warn(warning)
+		}
 	}
 	resolved, err := resolveTextEphemeral(ctx, sender, to, ephemeral)
 	if err != nil {
@@ -276,6 +326,9 @@ func sendTextMessageWithSender(ctx context.Context, sender textMessageSender, db
 	}
 	if resolved.hasExpiration {
 		applyEphemeralContext(msg, resolved.expiration)
+	}
+	if options.replyContext != nil {
+		*options.replyContext = msg.GetExtendedTextMessage().GetContextInfo()
 	}
 	return sender.SendProtoMessage(ctx, to, msg)
 }
@@ -424,21 +477,38 @@ func applyEphemeralContext(msg *waProto.Message, expiration uint32) {
 	}
 }
 
-func fetchLinkPreview(ctx context.Context, text string, disabled bool) *linkpreview.Preview {
+// fetchLinkPreview never writes output itself: delegated sends run it inside
+// the sync process, whose stderr may be an NDJSON event stream. A skipped
+// preview is returned as a warning for the output-owning caller to render.
+func fetchLinkPreview(ctx context.Context, text string, disabled bool) (*linkpreview.Preview, string) {
 	if disabled {
-		return nil
+		return nil, ""
 	}
 	rawURL := linkpreview.FindFirstHTTPURL(text)
 	if rawURL == "" {
-		return nil
+		return nil, ""
 	}
 	previewCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 	preview, err := linkpreview.Fetch(previewCtx, nil, rawURL)
 	if err != nil {
-		return nil
+		return nil, fmt.Sprintf("link preview skipped for %s: %v", rawURL, err)
 	}
-	return preview
+	return preview, ""
+}
+
+// linkPreviewSkippedHint tells the user the send went through and how to opt
+// out of preview fetching when the skip is expected.
+const linkPreviewSkippedHint = "message text was still sent without a preview; pass --no-preview to send without fetching one"
+
+// warnLinkPreviewSkipped prints a skipped-preview warning after a successful
+// send. The text carries remote, server-controlled error detail, so it is
+// sanitized for terminals.
+func warnLinkPreviewSkipped(w io.Writer, msg string) {
+	if msg == "" {
+		return
+	}
+	fmt.Fprintf(w, "warning: %s (%s)\n", out.SanitizeHuman(msg), linkPreviewSkippedHint)
 }
 
 func decodeMessageEscapes(s string) (string, error) {
@@ -471,17 +541,16 @@ func decodeMessageEscapes(s string) (string, error) {
 	return b.String(), nil
 }
 
-func buildTextMessage(db *store.DB, to types.JID, text, replyTo, replyToSender string, preview *linkpreview.Preview, mentionedJIDs []string) (*waProto.Message, bool, error) {
-	return buildTextMessageWithSelf(db, to, types.EmptyJID, text, replyTo, replyToSender, "", preview, mentionedJIDs)
-}
-
-func buildTextMessageWithSelf(db *store.DB, to, aliasTo types.JID, text, replyTo, replyToSender, selfJID string, preview *linkpreview.Preview, mentionedJIDs []string) (*waProto.Message, bool, error) {
-	info, err := buildTextContextInfo(db, to, aliasTo, replyTo, replyToSender, selfJID, mentionedJIDs)
-	if err != nil {
-		return nil, false, err
+func buildTextMessage(text string, reply *waProto.ContextInfo, preview *linkpreview.Preview, mentionedJIDs []string) (*waProto.Message, bool) {
+	info := reply
+	if len(mentionedJIDs) > 0 {
+		if info == nil {
+			info = &waProto.ContextInfo{}
+		}
+		info.MentionedJID = append([]string(nil), mentionedJIDs...)
 	}
 	if info == nil && preview == nil {
-		return nil, true, nil
+		return nil, true
 	}
 
 	ext := &waProto.ExtendedTextMessage{
@@ -489,7 +558,7 @@ func buildTextMessageWithSelf(db *store.DB, to, aliasTo types.JID, text, replyTo
 		ContextInfo: info,
 	}
 	attachLinkPreview(ext, preview)
-	return &waProto.Message{ExtendedTextMessage: ext}, false, nil
+	return &waProto.Message{ExtendedTextMessage: ext}, false
 }
 
 func attachLinkPreview(msg *waProto.ExtendedTextMessage, preview *linkpreview.Preview) {
@@ -532,19 +601,20 @@ func replyLookupAlias(ctx context.Context, sender textMessageSender, to types.JI
 	}
 }
 
-func buildTextContextInfo(db *store.DB, chat, aliasChat types.JID, replyTo, replyToSender, selfJID string, mentionedJIDs []string) (*waProto.ContextInfo, error) {
-	info, err := buildTextReplyContextInfo(db, chat, aliasChat, replyTo, replyToSender, selfJID)
+// buildReplyContextInfo builds the native quote for every send that takes
+// --reply-to (text, file, voice, sticker). The stored message is looked up under
+// the chat or its phone/LID alias and its content is quoted; an unknown message
+// is refused unless --reply-to-sender names its author in a group.
+func buildReplyContextInfo(ctx context.Context, sender textMessageSender, db *store.DB, chat types.JID, replyTo, replyToSender string) (*waProto.ContextInfo, error) {
+	if strings.TrimSpace(replyTo) == "" {
+		return nil, nil
+	}
+	aliasChat := replyLookupAlias(ctx, sender, chat)
+	selfJID, err := textReplySelfJID(ctx, sender, db, chat, aliasChat, replyTo, replyToSender)
 	if err != nil {
 		return nil, err
 	}
-	if len(mentionedJIDs) == 0 {
-		return info, nil
-	}
-	if info == nil {
-		info = &waProto.ContextInfo{}
-	}
-	info.MentionedJID = append([]string(nil), mentionedJIDs...)
-	return info, nil
+	return buildTextReplyContextInfo(db, chat, aliasChat, replyTo, replyToSender, selfJID)
 }
 
 func buildTextReplyContextInfo(db *store.DB, chat, aliasChat types.JID, replyTo, replyToSender, selfJID string) (*waProto.ContextInfo, error) {
@@ -591,7 +661,7 @@ func storedQuotedMessage(db *store.DB, msg store.Message) (*waProto.Message, err
 		return nil, fmt.Errorf("stored message was deleted")
 	}
 	if msg.ReactionToID != "" || len(msg.Buttons) > 0 {
-		return nil, fmt.Errorf("stored message content is not supported for quoted text replies")
+		return nil, fmt.Errorf("stored message content is not supported for quoted replies")
 	}
 	if mediaType := strings.ToLower(strings.TrimSpace(msg.MediaType)); mediaType != "" {
 		if !isStoredMediaType(mediaType) {
@@ -638,53 +708,6 @@ func resolveTextReplyParticipant(chat types.JID, msg store.Message, override, se
 		return chat, nil
 	}
 	return types.JID{}, fmt.Errorf("--reply-to-sender is required because the stored group message has no sender")
-}
-
-func buildReplyContextInfo(db *store.DB, chat types.JID, replyTo, replyToSender string) (*waProto.ContextInfo, error) {
-	replyTo = strings.TrimSpace(replyTo)
-	if replyTo == "" {
-		return nil, nil
-	}
-
-	sender, err := resolveReplySender(db, chat, replyTo, replyToSender)
-	if err != nil {
-		return nil, err
-	}
-
-	stanzaID := replyTo
-	info := &waProto.ContextInfo{StanzaID: proto.String(stanzaID)}
-	if !sender.IsEmpty() {
-		participant := sender.String()
-		info.Participant = proto.String(participant)
-	}
-	return info, nil
-}
-
-func resolveReplySender(db *store.DB, chat types.JID, replyTo, override string) (types.JID, error) {
-	if strings.TrimSpace(override) != "" {
-		jid, err := wa.ParseUserOrJID(override)
-		if err != nil {
-			return types.JID{}, fmt.Errorf("invalid --reply-to-sender: %w", err)
-		}
-		return jid, nil
-	}
-
-	msg, err := db.GetMessage(chat.String(), replyTo)
-	if err != nil && !errors.Is(err, sql.ErrNoRows) {
-		return types.JID{}, fmt.Errorf("lookup quoted message: %w", err)
-	}
-	if err == nil && strings.TrimSpace(msg.SenderJID) != "" {
-		jid, err := types.ParseJID(msg.SenderJID)
-		if err != nil {
-			return types.JID{}, fmt.Errorf("stored quoted sender is invalid: %w", err)
-		}
-		return jid, nil
-	}
-
-	if chat.Server == types.GroupServer {
-		return types.JID{}, fmt.Errorf("--reply-to-sender is required for unsynced group replies")
-	}
-	return types.JID{}, nil
 }
 
 func parseMentionedJIDs(values []string) ([]string, error) {

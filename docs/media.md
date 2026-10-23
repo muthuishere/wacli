@@ -7,14 +7,33 @@ Read when: downloading media from a synced message.
 ## Commands
 
 ```bash
-wacli media download --chat JID --id MSG_ID [--output PATH]
+wacli media download --chat JID --id MSG_ID [--output PATH] [--retry-on-phone]
 wacli media backfill [--chat JID] [--limit N] [--workers N]
-wacli media retry [--chat JID] [--before YYYY-MM-DD] [--limit N] [--batch N] [--wait DUR]
+wacli media retry [--chat JID] [--type TYPE] [--before YYYY-MM-DD] [--limit N] [--batch N] [--wait DUR]
 ```
 
 ## download
 
 Downloads media for a single message.
+
+Downloads first reuse a recorded local copy whose plaintext SHA-256 and declared
+length match the message. Missing or invalid copies fall back to the server;
+failed verification never replaces a good output. Cache hits work without a
+writable session or store lock. JSON adds `source`: `cache`, `server` or `phone`.
+
+Add `--retry-on-phone` to recover this exact chat/message after a server download
+returns HTTP 403, 404 or 410. A running sync process handles recovery over its
+existing local endpoint without pausing sync or blocking the chat-send queue.
+Otherwise the command uses its normal locked connection. Old daemons that do
+not support media delegation fail explicitly; they are never stopped as fallback.
+One phone request waits at most 30 seconds within the command timeout. A phone
+that does not respond is `no_response`, not proof of deletion. Recovery still
+requires the phone to retain and supply the recording.
+
+Phone recovery is writable and cannot be combined with `--read-only`. Read-only
+downloads may reuse a verified cache or fetch directly, but do not request phone
+recovery, record output paths or mark conversations read. After an uncertain
+recovery response, check the exact local file before requesting recovery again.
 
 ### Notes
 
@@ -23,6 +42,7 @@ Downloads media for a single message.
 - `--output` may be a file path or directory.
 - If `--output` is omitted, media is written under the store media directory.
 - `--read-only` is supported only with explicit `--output`; it writes the file without opening the WhatsApp session store or recording `local_path` / `downloaded_at`.
+- `--read-only` takes **no store lock**, so direct/cache retrieval works during `sync --follow`. Writable cache misses delegate to a compatible running sync process; without a compatible endpoint, the held store lock is reported explicitly. `--lock-wait` does not release a follow session's lock.
 
 ### Examples
 
@@ -31,7 +51,11 @@ wacli media download --chat 1234567890@s.whatsapp.net --id ABC123
 wacli media download --chat 1234567890@s.whatsapp.net --id ABC123 --output ./downloads
 wacli media download --chat 1234567890@s.whatsapp.net --id ABC123 --output ./photo.jpg
 wacli --read-only media download --chat 1234567890@s.whatsapp.net --id ABC123 --output /tmp/photo.jpg
+wacli media download --chat 1234567890@s.whatsapp.net --id ABC123 --output /tmp/photo.jpg --retry-on-phone
 ```
+
+A cache miss closes its read-only database connection before opening the writable
+store, including when WAL sidecars remain from a previous connection.
 
 ## backfill
 
@@ -77,10 +101,17 @@ also confirmed expired, so later runs can skip genuinely unavailable rows.
 
 - Requires a writable store and an online phone; not available in `--read-only` mode.
 - Run `media backfill` first; retry is intended for media whose direct CDN download failed.
+- Successful retry responses download the re-upload without reusing the original ciphertext hash. The original media-key HMAC, plaintext SHA-256, size limit, and declared file length still apply; failed verification leaves the media pending and does not replace a local file.
 - Retry receipts are sent in batches (`--batch`, default 32) with a second
   attempt for non-responders; `--wait` (default 30s) bounds each attempt.
 - `--chat` scopes to one chat; `--before YYYY-MM-DD` scopes to media older than a date.
+- `--type` scopes to one kind of media: `image`, `video`, `gif`, `audio`,
+  `document` or `sticker`. Voice notes are stored as `audio`, so
+  `--type audio` recovers them without also re-uploading every expired photo
+  and video, which usually make up most of the bytes. Any other value is
+  rejected.
 - `--limit` caps how many messages to retry (0 = all pending); newest first.
+  It counts only the messages that match the other filters.
 - Runs until completion or interruption by default; explicitly set global `--timeout` to cap a run.
 - Reports counts: requested, recovered, not_on_phone (gone), no_response, failed.
 - `no_response` means the phone did not answer in time (often transient) — those
@@ -92,5 +123,6 @@ also confirmed expired, so later runs can skip genuinely unavailable rows.
 wacli media retry                                    # try to recover all pending media
 wacli media retry --chat 1234567890@s.whatsapp.net   # one chat only
 wacli media retry --before 2026-01-01                # only media older than a date
+wacli media retry --type audio                       # only audio, voice notes included
 wacli media retry --limit 50 --wait 45s --json       # bounded run, machine-readable
 ```

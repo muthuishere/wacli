@@ -11,10 +11,13 @@ Read when: you need the user-facing command map, global flags, store model, or l
 - Override the store with `--store DIR` or `WACLI_STORE_DIR`.
 - Human-readable tables are the default.
 - Use `--json` for scriptable output.
+- Libsignal warnings and errors go to stderr, not stdout. With `--events`, they use NDJSON `warning` events with `data.code=libsignal_diagnostic`, the original `level`, `source`, `caller`, and a safe `message`. These diagnostics can precede a successful fallback and do not themselves mean the command failed.
+- Libsignal diagnostics retain known operation labels or safe error categories, redact dynamic details, and report unknown messages generically. Debug and info logging are disabled to avoid exposing cryptographic material; libsignal v0.2.2 has no production info calls.
 - A successful JSON command exits successfully if its pipe reader closes early. Other output errors and command failures still return a nonzero exit status.
 - Use `--full` to avoid table truncation.
 - Write commands acquire the store lock; use `--lock-wait DURATION` to wait.
 - Use `--read-only` or `WACLI_READONLY=1` to reject commands that write WhatsApp or local state.
+- Use `WACLI_MEDIA_ROOTS` to confine which local files send commands may upload (see [send](send.md#files)).
 - Use `sync --max-messages`, `sync --max-db-size`, `WACLI_SYNC_MAX_MESSAGES`, or `WACLI_SYNC_MAX_DB_SIZE` to bound local history growth.
 - Use `store cleanup`, `chats cleanup`, and `groups prune` to preview and remove stale local rows after sync has already stored them.
 - Authenticated startup resolves historical `@lid` chat/message rows to phone-number JIDs when the WhatsApp session store has the mapping.

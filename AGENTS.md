@@ -24,11 +24,11 @@
 ## Build, Test, and Development Commands
 - Build: `pnpm build` — compiles with `-tags sqlite_fts5` and `CGO_CFLAGS=-Wno-error=missing-braces` (required for GCC 15+).
 - Run: `pnpm wacli -- <args>` — rebuilds then runs.
-- Test: `pnpm test` — runs `go test ./...` (plain), `go test -tags sqlite_fts5 ./...` (FTS), and a Windows lock cross-compile check.
-- Lint: `pnpm lint` — `go vet ./...`.
+- Test: `pnpm test` — runs plain and FTS Go tests, the Windows lock/store test cross-compiles, cgo-required build check, and Node documentation/release-script tests.
+- Lint: `pnpm lint` — `go vet ./...`; `make lint` also runs vulnerability checks and `pnpm lint:deadcode` for production and test reachability.
 - Format fix: `pnpm format` — `gofmt -w .`.
 - Format check: `pnpm format:check` — fails if any file would change.
-- **Full gate** (must pass before every PR): `pnpm format:check && pnpm lint && pnpm test && pnpm build && git diff --check`.
+- **Full gate** (must pass before every PR): `pnpm format:check && pnpm lint && pnpm lint:deadcode && pnpm test && pnpm build && pnpm docs:site && git diff --check`.
 
 ## Coding Style
 - Standard `gofmt` formatting; run `pnpm format` before committing.
@@ -41,6 +41,7 @@
 - FTS-sensitive tests must run under `-tags sqlite_fts5`; non-FTS path tests must also pass without the tag.
 - Use `fake_wa_test.go` / table-driven tests for whatsmeow interaction; avoid hitting real WhatsApp in unit tests.
 - Integration tests that need a live account are opt-in and not part of the standard gate.
+- Local retrieval CLI scenarios: `WACLI_RETRIEVAL_ARTIFACTS=/outside/repository/artifacts go test ./internal/app -run '^TestRetrievalStage[123]CLI$' -count=1` (repeat with `-tags sqlite_fts5`). These build and execute the real CLI against disposable stores and save per-scenario transcripts.
 
 ## Commit & Pull Request Guidelines
 - Follow Conventional Commits: `feat:`, `fix:`, `docs:`, `refactor:`, `test:`, `security:`, `ci:` with an imperative summary.

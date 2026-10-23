@@ -2,6 +2,7 @@ package store
 
 import (
 	"database/sql"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -18,6 +19,11 @@ type DB struct {
 	sql        *sql.DB
 	q          *storedb.Queries
 	ftsEnabled bool
+	// A store written by an older build has no receipt table, and a read-only
+	// open cannot create one, so message queries ask for the counts only when
+	// the table is there.
+	receiptsEnabled bool
+	readRows        queryRows
 }
 
 func Open(path string) (*DB, error) {
@@ -56,12 +62,14 @@ func open(path string, readOnly bool) (*DB, error) {
 			return nil, fmt.Errorf("open read-only sqlite: %w", err)
 		}
 		s.ftsEnabled = s.detectMessagesFTS()
+		s.receiptsEnabled = s.hasTable("message_receipts")
 		return s, nil
 	}
 	if err := s.init(); err != nil {
 		_ = db.Close()
 		return nil, err
 	}
+	s.receiptsEnabled = s.hasTable("message_receipts")
 	if err := sqliteutil.ChmodFiles(path, 0o600); err != nil {
 		_ = db.Close()
 		return nil, err
@@ -74,10 +82,15 @@ func (d *DB) validateReadable() error {
 	return d.sql.QueryRow("SELECT count(*) FROM sqlite_master").Scan(&n)
 }
 
+func (d *DB) hasTable(name string) bool {
+	ok, err := d.tableExists(name)
+	return err == nil && ok
+}
+
 func sqliteURI(path string, readOnly bool) string {
 	params := "_foreign_keys=on&_busy_timeout=5000"
 	if readOnly {
-		params += "&mode=ro&_query_only=1"
+		params += "&mode=ro&_query_only=1&readonly_shm=1"
 		if !sqliteSidecarsExist(path) {
 			params += "&immutable=1"
 		}
@@ -112,6 +125,10 @@ func (d *DB) init() error {
 		return err
 	}
 
+	if err := d.cleanupChanges(); err != nil {
+		return err
+	}
+
 	// Detect FTS5 availability independently of migration state. The migration
 	// sets ftsEnabled only on first run; subsequent opens skip the migration.
 	if !d.ftsEnabled {
@@ -130,6 +147,10 @@ func (d *DB) detectMessagesFTS() bool {
 	if err != nil || !hasDisplayText {
 		return false
 	}
-	var n int
-	return d.sql.QueryRow("SELECT count(*) FROM messages_fts").Scan(&n) == nil
+	// One row is enough: a build without FTS5 fails as soon as the table is
+	// read. count(*) would walk the whole index on every open, a cost that
+	// grows with the archive and that every command pays.
+	var rowid int64
+	err = d.sql.QueryRow("SELECT rowid FROM messages_fts LIMIT 1").Scan(&rowid)
+	return err == nil || errors.Is(err, sql.ErrNoRows)
 }

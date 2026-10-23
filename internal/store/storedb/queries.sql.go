@@ -39,6 +39,20 @@ func (q *Queries) ClearAllSystemNames(ctx context.Context, updatedAt int64) (int
 	return result.RowsAffected()
 }
 
+const clearContactActionName = `-- name: ClearContactActionName :exec
+UPDATE contacts SET full_name = NULL, first_name = NULL, updated_at = ? WHERE jid = ?
+`
+
+type ClearContactActionNameParams struct {
+	UpdatedAt int64
+	Jid       string
+}
+
+func (q *Queries) ClearContactActionName(ctx context.Context, arg ClearContactActionNameParams) error {
+	_, err := q.db.ExecContext(ctx, clearContactActionName, arg.UpdatedAt, arg.Jid)
+	return err
+}
+
 const countChatMessages = `-- name: CountChatMessages :one
 SELECT COUNT(1) FROM messages WHERE chat_jid = ?
 `
@@ -209,28 +223,6 @@ type DeletePollParams struct {
 
 func (q *Queries) DeletePoll(ctx context.Context, arg DeletePollParams) error {
 	_, err := q.db.ExecContext(ctx, deletePoll, arg.ChatJid, arg.MsgID)
-	return err
-}
-
-const deletePollVote = `-- name: DeletePollVote :exec
-DELETE FROM poll_votes
-WHERE chat_jid = ? AND poll_msg_id = ? AND voter_jid = ? AND ts <= ?
-`
-
-type DeletePollVoteParams struct {
-	ChatJid   string
-	PollMsgID string
-	VoterJid  string
-	Ts        int64
-}
-
-func (q *Queries) DeletePollVote(ctx context.Context, arg DeletePollVoteParams) error {
-	_, err := q.db.ExecContext(ctx, deletePollVote,
-		arg.ChatJid,
-		arg.PollMsgID,
-		arg.VoterJid,
-		arg.Ts,
-	)
 	return err
 }
 
@@ -781,6 +773,52 @@ func (q *Queries) ListContacts(ctx context.Context, limit int64) ([]ListContacts
 	return items, nil
 }
 
+const listGroupParticipants = `-- name: ListGroupParticipants :many
+SELECT group_jid, user_jid, COALESCE(role, 'member') AS role, updated_at
+FROM group_participants
+WHERE group_jid = ?
+ORDER BY CASE role
+    WHEN 'superadmin' THEN 1
+    WHEN 'admin' THEN 2
+    ELSE 3
+END, user_jid ASC
+`
+
+type ListGroupParticipantsRow struct {
+	GroupJid  string
+	UserJid   string
+	Role      string
+	UpdatedAt int64
+}
+
+func (q *Queries) ListGroupParticipants(ctx context.Context, groupJid string) ([]ListGroupParticipantsRow, error) {
+	rows, err := q.db.QueryContext(ctx, listGroupParticipants, groupJid)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []ListGroupParticipantsRow
+	for rows.Next() {
+		var i ListGroupParticipantsRow
+		if err := rows.Scan(
+			&i.GroupJid,
+			&i.UserJid,
+			&i.Role,
+			&i.UpdatedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listJoinedGroupJIDs = `-- name: ListJoinedGroupJIDs :many
 SELECT jid FROM groups WHERE left_at IS NULL
 `
@@ -869,13 +907,15 @@ WHERE COALESCE(m.media_type,'') != ''
   AND m.media_unavailable_at IS NULL
   AND m.ts < ?1
   AND (?2 = '' OR m.chat_jid = ?2)
+  AND (?3 = '' OR m.media_type = ?3)
 ORDER BY m.ts DESC, m.rowid DESC
-LIMIT CASE WHEN ?3 <= 0 THEN -1 ELSE ?3 END
+LIMIT CASE WHEN ?4 <= 0 THEN -1 ELSE ?4 END
 `
 
 type ListPendingMediaBeforeParams struct {
 	BeforeTs   int64
 	ChatJid    interface{}
+	MediaType  interface{}
 	LimitCount interface{}
 }
 
@@ -885,7 +925,12 @@ type ListPendingMediaBeforeRow struct {
 }
 
 func (q *Queries) ListPendingMediaBefore(ctx context.Context, arg ListPendingMediaBeforeParams) ([]ListPendingMediaBeforeRow, error) {
-	rows, err := q.db.QueryContext(ctx, listPendingMediaBefore, arg.BeforeTs, arg.ChatJid, arg.LimitCount)
+	rows, err := q.db.QueryContext(ctx, listPendingMediaBefore,
+		arg.BeforeTs,
+		arg.ChatJid,
+		arg.MediaType,
+		arg.LimitCount,
+	)
 	if err != nil {
 		return nil, err
 	}
@@ -917,12 +962,14 @@ WHERE COALESCE(m.media_type,'') != ''
   AND m.deleted_at IS NULL
   AND m.media_unavailable_at IS NULL
   AND (?1 = '' OR m.chat_jid = ?1)
+  AND (?2 = '' OR m.media_type = ?2)
 ORDER BY m.ts DESC, m.rowid DESC
-LIMIT CASE WHEN ?2 <= 0 THEN -1 ELSE ?2 END
+LIMIT CASE WHEN ?3 <= 0 THEN -1 ELSE ?3 END
 `
 
 type ListPendingMediaDownloadsParams struct {
 	ChatJid    interface{}
+	MediaType  interface{}
 	LimitCount interface{}
 }
 
@@ -932,7 +979,7 @@ type ListPendingMediaDownloadsRow struct {
 }
 
 func (q *Queries) ListPendingMediaDownloads(ctx context.Context, arg ListPendingMediaDownloadsParams) ([]ListPendingMediaDownloadsRow, error) {
-	rows, err := q.db.QueryContext(ctx, listPendingMediaDownloads, arg.ChatJid, arg.LimitCount)
+	rows, err := q.db.QueryContext(ctx, listPendingMediaDownloads, arg.ChatJid, arg.MediaType, arg.LimitCount)
 	if err != nil {
 		return nil, err
 	}
@@ -1582,6 +1629,35 @@ type SetChatPinnedParams struct {
 
 func (q *Queries) SetChatPinned(ctx context.Context, arg SetChatPinnedParams) error {
 	_, err := q.db.ExecContext(ctx, setChatPinned, arg.Jid, arg.Pinned)
+	return err
+}
+
+const setContactActionName = `-- name: SetContactActionName :exec
+INSERT INTO contacts(jid, phone, full_name, first_name, updated_at)
+VALUES (?, ?, ?, ?, ?)
+ON CONFLICT(jid) DO UPDATE SET
+    phone=COALESCE(NULLIF(excluded.phone,''), contacts.phone),
+    full_name=excluded.full_name,
+    first_name=excluded.first_name,
+    updated_at=excluded.updated_at
+`
+
+type SetContactActionNameParams struct {
+	Jid       string
+	Phone     sql.NullString
+	FullName  sql.NullString
+	FirstName sql.NullString
+	UpdatedAt int64
+}
+
+func (q *Queries) SetContactActionName(ctx context.Context, arg SetContactActionNameParams) error {
+	_, err := q.db.ExecContext(ctx, setContactActionName,
+		arg.Jid,
+		arg.Phone,
+		arg.FullName,
+		arg.FirstName,
+		arg.UpdatedAt,
+	)
 	return err
 }
 

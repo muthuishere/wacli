@@ -52,7 +52,7 @@ type syncPresence struct {
 	cleanupStarted bool
 }
 
-func (a *App) addSyncEventHandler(ctx context.Context, opts SyncOptions, messagesStored, lastEvent *atomic.Int64, disconnected chan<- struct{}, loggedOut chan<- struct{}, staleReconnect chan<- staleReconnectRequest, enqueueMedia func(string, string), enqueueWebhook func(syncWebhookEvent), limits *syncStorageLimits, ps *syncPresence, mediaQ *mediaQueue) uint32 {
+func (a *App) addSyncEventHandler(ctx context.Context, opts SyncOptions, messagesStored, lastEvent *atomic.Int64, disconnected chan<- struct{}, loggedOut chan<- struct{}, staleReconnect chan<- staleReconnectRequest, enqueueMedia func(string, string), enqueueWebhook func(syncWebhookEvent), limits *syncStorageLimits, ps *syncPresence, mediaQ *mediaQueue) (uint32, *sync.Map) {
 	var panicCount atomic.Int64
 	var appStateRecoveries sync.Map
 	if enqueueWebhook == nil {
@@ -62,7 +62,7 @@ func (a *App) addSyncEventHandler(ctx context.Context, opts SyncOptions, message
 	if !opts.WebhookEvents.Enabled(SyncWebhookEventMessage) {
 		enqueueWebhookMessage = func(wa.ParsedMessage) {}
 	}
-	return a.wa.AddEventHandler(func(evt interface{}) {
+	handlerID := a.wa.AddEventHandler(func(evt any) {
 		if mediaQ != nil {
 			if !mediaQ.beginProducer() {
 				return
@@ -77,6 +77,9 @@ func (a *App) addSyncEventHandler(ctx context.Context, opts SyncOptions, message
 		// process. Include event type, stack trace, and a running counter.
 		defer func() {
 			if r := recover(); r != nil {
+				if limits != nil {
+					limits.persistenceFailed.Store(true)
+				}
 				n := panicCount.Add(1)
 				if a.eventsEnabled() {
 					a.emitEvent("event_handler_panic", map[string]any{
@@ -107,15 +110,33 @@ func (a *App) addSyncEventHandler(ctx context.Context, opts SyncOptions, message
 			lastEvent.Store(nowUTC().UnixNano())
 			a.handleLiveCallEvent(ctx, v)
 		case *events.AppState, *events.Star, *events.DeleteForMe,
-			*events.Archive, *events.Pin, *events.Mute, *events.MarkChatAsRead:
+			*events.Archive, *events.UnarchiveChatsSetting, *events.Pin, *events.Mute, *events.MarkChatAsRead,
+			*events.Contact:
 			lastEvent.Store(nowUTC().UnixNano())
-			a.handleAppStatePersistenceEvent(ctx, v, nil)
+			if limits != nil {
+				limits.appStatePending.Add(1)
+			}
+			a.handleAppStatePersistenceEvent(ctx, v, func(err error) {
+				if limits != nil {
+					if err != nil {
+						limits.persistenceFailed.Store(true)
+					}
+					limits.appStatePending.Add(-1)
+				}
+			})
 		case *events.HistorySync:
 			lastEvent.Store(nowUTC().UnixNano())
 			a.handleHistorySync(ctx, opts, v, messagesStored, lastEvent, enqueueMedia, limits)
+			// Backfill checks local anchors as soon as it receives this response.
+			if opts.afterHistorySync != nil {
+				opts.afterHistorySync(v)
+			}
 		case *events.Receipt:
 			lastEvent.Store(nowUTC().UnixNano())
 			a.handleReceiptPersistenceEvent(ctx, v)
+			if err := a.handleOutgoingReceiptEvent(ctx, v); err != nil && limits != nil {
+				limits.persistenceFailed.Store(true)
+			}
 			if opts.WebhookEvents.Enabled(SyncWebhookEventReceipt) {
 				if job, ok := newSyncWebhookReceiptEvent(v); ok {
 					enqueueWebhook(job)
@@ -129,11 +150,71 @@ func (a *App) addSyncEventHandler(ctx context.Context, opts SyncOptions, message
 					enqueueWebhook(job)
 				}
 			}
+			if a.eventsEnabled() {
+				if data, ok := a.chatPresenceEventData(ctx, v); ok {
+					a.emitEvent("chat_presence", data)
+				}
+			}
+		case *events.Presence:
+			// Only users this device subscribed to (presence subscribe) send
+			// these. Like typing, they must not keep an idle-exit sync alive.
+			if a.eventsEnabled() {
+				a.emitEvent("presence", a.presenceEventData(ctx, v))
+			}
+		case *events.GroupInfo:
+			// The group changed: its next message asks for its info again.
+			a.forgetGroupInfo(v.JID)
+		case *events.JoinedGroup:
+			a.forgetGroupInfo(v.JID)
+		case *events.UndecryptableMessage:
+			if v == nil {
+				return
+			}
+			// A message that arrived but could not be read. Report it, so that a
+			// hole in a chat is never silent, and say which recovery this event
+			// actually gets: they are not the same.
+			lastEvent.Store(nowUTC().UnixNano())
+			recovery, warning := undecryptableWarning(v)
+			a.emitWarning("undecryptable_message", warning,
+				map[string]any{
+					"chat_jid":         v.Info.Chat.String(),
+					"sender_jid":       v.Info.Sender.String(),
+					"msg_id":           string(v.Info.ID),
+					"is_unavailable":   v.IsUnavailable,
+					"unavailable_type": string(v.UnavailableType),
+					"fail_mode":        string(v.DecryptFailMode),
+					"recovery":         recovery,
+				})
+		case *events.OfflineSyncPreview:
+			// Emitted right after connecting when the server is about to send
+			// what this device missed while it was down.
+			a.emitOrPrint("offline_sync_preview", map[string]any{
+				"total":            v.Total,
+				"messages":         v.Messages,
+				"receipts":         v.Receipts,
+				"notifications":    v.Notifications,
+				"app_data_changes": v.AppDataChanges,
+			}, "\nReplaying offline backlog: %d message(s), %d event(s) total.\n", v.Messages, v.Total)
+		case *events.OfflineSyncCompleted:
+			if ctx.Err() == nil && limits.canRecordFreshness() && a.wa.IsConnected() && a.wa.IsAuthed() {
+				if err := a.db.RecordSuccessfulSync(nowUTC()); err != nil {
+					a.emitWarning("sync_state_write_failed", fmt.Sprintf("record successful sync: %v", err), nil)
+				}
+			}
+			a.emitOrPrint("offline_sync_completed", map[string]any{
+				"count": v.Count,
+			}, "\nOffline backlog replayed (%d event(s)).\n", v.Count)
 		case *events.Connected:
+			// Group changes made while disconnected may not all come back as
+			// events: ask for every group's info afresh.
+			a.forgetAllGroupInfo()
 			a.emitOrPrint("connected", nil, "\nConnected.\n")
 			ps.mu.Lock()
 			if !ps.cleanupStarted && opts.PresenceMode.SendsAvailablePresence() {
 				a.sendPresenceBounded(types.PresenceAvailable)
+				// Presence subscriptions end with the connection that made
+				// them. Started under ps.mu, so the cleanup stops every one.
+				a.renewPresenceWatches(ctx)
 			}
 			ps.mu.Unlock()
 		case *events.KeepAliveTimeout:
@@ -154,13 +235,15 @@ func (a *App) addSyncEventHandler(ctx context.Context, opts SyncOptions, message
 			a.emitOrPrint("stream_replaced", nil, "\nStream replaced.\n")
 			// whatsmeow emits StreamReplaced before onDisconnect necessarily
 			// clears the socket, so force-close before reconnecting.
-			a.wa.Close()
+			a.wa.Disconnect()
 			select {
 			case disconnected <- struct{}{}:
 			default:
 			}
 		case *events.AppStateSyncError:
 			a.handleAppStateSyncError(ctx, v, &appStateRecoveries)
+		case *wa.AppStateKeyUnavailable:
+			a.warnEmptyAppStateKey(v)
 		case *events.LoggedOut:
 			// WhatsApp revoked this session (linked device removed on the phone,
 			// or a logout/ban). whatsmeow reconnects on Disconnected, so without
@@ -178,6 +261,7 @@ func (a *App) addSyncEventHandler(ctx context.Context, opts SyncOptions, message
 			}
 		}
 	})
+	return handlerID, &appStateRecoveries
 }
 
 func (a *App) handleKeepAliveTimeout(opts SyncOptions, evt *events.KeepAliveTimeout, staleReconnect chan<- staleReconnectRequest) {
@@ -201,7 +285,7 @@ func (a *App) handleKeepAliveTimeout(opts SyncOptions, evt *events.KeepAliveTime
 	}
 }
 
-func syncActivityEvent(evt interface{}) bool {
+func syncActivityEvent(evt any) bool {
 	switch evt.(type) {
 	case nil,
 		*events.KeepAliveTimeout,
@@ -223,10 +307,14 @@ func syncActivityEvent(evt interface{}) bool {
 	}
 }
 
-func (a *App) handleAppStatePersistenceEvent(ctx context.Context, evt interface{}, tracker *appStatePersistenceTracker) {
-	if tracker != nil {
-		a.persistAppStateEvent(ctx, evt, tracker)
-		return
+// onPersisted runs at the ordered write boundary, including when this event
+// was queued behind startup replay. Sync uses it to track freshness safely.
+func (a *App) handleAppStatePersistenceEvent(ctx context.Context, evt any, onPersisted func(error)) {
+	a.observeArchiveEvent(ctx, evt, false)
+	report := func(err error) {
+		if onPersisted != nil {
+			onPersisted(err)
+		}
 	}
 	ticket := a.appStatePersist.reserveLive()
 	markers, markerErr := a.markLiveAppStateRecovery(evt)
@@ -237,7 +325,7 @@ func (a *App) handleAppStatePersistenceEvent(ctx context.Context, evt interface{
 			map[string]any{"error": markerErr.Error()},
 		)
 		persistCtx := context.WithoutCancel(ctx)
-		a.persistAppStateEvent(persistCtx, evt, nil)
+		firstErr := a.persistAppStateEvent(persistCtx, evt, nil)
 		retryMarkers, retryErr := a.markLiveAppStateRecovery(evt)
 		if retryErr != nil {
 			a.emitWarning(
@@ -248,6 +336,7 @@ func (a *App) handleAppStatePersistenceEvent(ctx context.Context, evt interface{
 		}
 		a.appStatePersist.completeOne(ticket, func() {
 			orderedErr := a.persistAppStateEvent(persistCtx, evt, nil)
+			report(errors.Join(markerErr, firstErr, retryErr, orderedErr))
 			if orderedErr == nil {
 				a.clearLiveAppStateRecovery(retryMarkers)
 			} else if retryErr != nil {
@@ -268,6 +357,7 @@ func (a *App) handleAppStatePersistenceEvent(ctx context.Context, evt interface{
 		if persistenceErr == nil {
 			a.clearLiveAppStateRecovery(markers)
 		}
+		report(persistenceErr)
 	})
 }
 
@@ -276,7 +366,7 @@ type appStateRecoveryMarker struct {
 	generation int64
 }
 
-func (a *App) markLiveAppStateRecovery(evt interface{}) ([]appStateRecoveryMarker, error) {
+func (a *App) markLiveAppStateRecovery(evt any) ([]appStateRecoveryMarker, error) {
 	collections := appStateCollectionsForEvent(evt)
 	names := make([]string, len(collections))
 	for i, collection := range collections {
@@ -305,7 +395,7 @@ func (a *App) clearLiveAppStateRecovery(markers []appStateRecoveryMarker) {
 	}
 }
 
-func (a *App) persistAppStateEvent(ctx context.Context, evt interface{}, tracker *appStatePersistenceTracker) error {
+func (a *App) persistAppStateEvent(ctx context.Context, evt any, tracker *appStatePersistenceTracker) error {
 	var err error
 	switch v := evt.(type) {
 	case *events.AppState:
@@ -314,21 +404,28 @@ func (a *App) persistAppStateEvent(ctx context.Context, evt interface{}, tracker
 		err = a.handleStarEvent(ctx, v)
 	case *events.DeleteForMe:
 		err = a.handleDeleteForMeEvent(ctx, v)
-	case *events.Archive, *events.Pin, *events.Mute, *events.MarkChatAsRead:
+	case *events.Archive, *events.UnarchiveChatsSetting, *events.Pin, *events.Mute, *events.MarkChatAsRead:
 		err = a.handleChatStateEvent(ctx, v)
+	case *events.Contact:
+		err = a.handleContactEvent(ctx, v)
 	}
 	if tracker != nil {
 		tracker.record(err)
 	}
+	if err == nil {
+		a.observeArchiveEvent(ctx, evt, true)
+	}
 	return err
 }
 
-func appStateCollectionsForEvent(evt interface{}) []appstate.WAPatchName {
+func appStateCollectionsForEvent(evt any) []appstate.WAPatchName {
 	switch v := evt.(type) {
-	case *events.Archive, *events.Pin, *events.MarkChatAsRead:
+	case *events.Archive, *events.UnarchiveChatsSetting, *events.Pin, *events.MarkChatAsRead:
 		return []appstate.WAPatchName{appstate.WAPatchRegularLow}
 	case *events.Mute, *events.Star, *events.DeleteForMe:
 		return []appstate.WAPatchName{appstate.WAPatchRegularHigh}
+	case *events.Contact:
+		return []appstate.WAPatchName{appstate.WAPatchCriticalUnblockLow}
 	case *events.AppState:
 		if v == nil || v.SyncActionValue == nil || (v.GetCallLogAction() == nil && v.GetDeleteIndividualCallLog() == nil) {
 			return nil
@@ -340,15 +437,41 @@ func appStateCollectionsForEvent(evt interface{}) []appstate.WAPatchName {
 }
 
 func (a *App) handleReceiptPersistenceEvent(ctx context.Context, evt *events.Receipt) {
-	if evt == nil || evt.Type != types.ReceiptTypeReadSelf || evt.Chat.IsEmpty() {
+	if evt == nil || evt.Chat.IsEmpty() || !readByThisAccountElsewhere(evt) {
 		return
 	}
 	a.handleReceiptEvent(ctx, evt)
 }
 
+// readByThisAccountElsewhere reports whether a receipt says this account read
+// the chat on another of its devices.
+//
+// WhatsApp only marks such a read "read-self" when read receipts are turned off
+// in the privacy settings. With them on, the phone broadcasts an ordinary
+// "read" receipt and this device receives that same one, sent by this account:
+// matching on the type alone therefore misses every account whose senders can
+// see blue ticks, and their unread counts never clear. A "read" receipt from
+// anyone else acknowledges an outgoing message and says nothing about what has
+// been read here.
+func readByThisAccountElsewhere(evt *events.Receipt) bool {
+	switch evt.Type {
+	case types.ReceiptTypeReadSelf:
+		return true
+	case types.ReceiptTypeRead:
+		return evt.IsFromMe
+	default:
+		return false
+	}
+}
+
 func (a *App) handleReceiptEvent(ctx context.Context, evt *events.Receipt) {
 	chat := a.canonicalStoreJID(ctx, evt.Chat)
-	if err := a.db.SetChatUnreadCount(canonicalJIDString(chat), 0); err != nil {
+	chatJID := canonicalJIDString(chat)
+	through, ids, err := a.receiptReadPosition(chatJID, evt)
+	if err == nil {
+		err = a.clearChatUnreadFromEvent(chatJID, through, ids)
+	}
+	if err != nil {
 		a.emitWarning(
 			"receipt_read_self_store_failed",
 			fmt.Sprintf("warning: failed to clear unread count from read-self receipt for chat %s: %v", chat, err),
@@ -392,7 +515,7 @@ func (a *App) handleDeleteForMeEvent(ctx context.Context, evt *events.DeleteForM
 	return nil
 }
 
-func (a *App) handleLiveCallEvent(ctx context.Context, evt interface{}) error {
+func (a *App) handleLiveCallEvent(ctx context.Context, evt any) error {
 	self := a.linkedLiveCallIdentity()
 	var alternateSelf []types.JID
 	if _, ok := evt.(*events.AppState); ok {
@@ -482,59 +605,56 @@ func (a *App) handleStarEvent(ctx context.Context, evt *events.Star) error {
 	return nil
 }
 
-func (a *App) handleAppStateSyncError(ctx context.Context, evt *events.AppStateSyncError, recoveries *sync.Map) {
-	if evt == nil || !errors.Is(evt.Error, appstate.ErrMismatchingLTHash) {
-		return
-	}
-	if a.ownsManualAppStateFetch(evt.Name) {
-		return
-	}
-	name := strings.TrimSpace(string(evt.Name))
-	if name == "" {
-		return
-	}
-	if recoveries == nil {
-		recoveries = &sync.Map{}
-	}
-	if _, loaded := recoveries.LoadOrStore(name, struct{}{}); loaded {
-		return
-	}
-
-	a.emitWarning(
-		"app_state_lthash_mismatch",
-		fmt.Sprintf("warning: app state %s hit an LTHash mismatch; requesting recovery snapshot", name),
-		map[string]any{"name": name},
-	)
-	go func() {
-		reqCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
-		defer cancel()
-		reqID, err := a.wa.RequestAppStateRecovery(reqCtx, name)
-		if err != nil {
-			a.emitWarning(
-				"app_state_recovery_failed",
-				fmt.Sprintf("warning: app state %s recovery request failed: %v", name, err),
-				map[string]any{"name": name, "error": err.Error()},
-			)
-			return
-		}
-		if a.eventsEnabled() {
-			a.emitEvent("app_state_recovery_requested", map[string]any{"name": name, "id": string(reqID)})
-		} else {
-			fmt.Fprintf(os.Stderr, "\rRequested app state %s recovery (id %s)\n", name, reqID)
-		}
-	}()
-}
-
 func (a *App) handleLiveSyncMessage(ctx context.Context, opts SyncOptions, v *events.Message, messagesStored *atomic.Int64, enqueueMedia func(string, string), enqueueWebhook func(wa.ParsedMessage), limits ...*syncStorageLimits) {
 	if historySyncNotificationFromMessage(v) != nil {
+		return
+	}
+	observedArchiveMS, observedSettingMS, archiveDisabled := a.observedArchiveBoundary(ctx, v.Info.Chat)
+	var ok bool
+	v, ok = a.decryptSecretEdit(ctx, v)
+	if !ok {
 		return
 	}
 	pm := wa.ParseLiveMessage(v)
 	if pm.ReactionToID != "" && pm.ReactionEmoji == "" && v.Message != nil && v.Message.GetEncReactionMessage() != nil {
 		a.decryptEncryptedReaction(ctx, &pm, v)
 	}
+	// Protocol retries can share an ID with decoded content. Preserve useful
+	// payloads so a later retry cannot look like a first unread transition.
+	// An explicit empty edit is a content update, not a protocol retry.
+	if !pm.Edited && !pm.HasContent() && pm.ID != "" && !pm.Chat.IsEmpty() && pm.Chat != types.StatusBroadcastJID {
+		chat := canonicalJIDString(a.canonicalStoreJID(ctx, pm.Chat))
+		if existing, err := a.db.GetMessage(chat, pm.ID); err == nil && !liveUnreadPlaceholder(existing) {
+			return
+		}
+	}
 	incrementUnread := a.shouldIncrementLiveUnread(ctx, pm)
-	if err := a.storeParsedMessageForSync(ctx, pm, limits...); err == nil {
+	storeOptions := messageStoreOptions{archiveIncoming: incrementUnread && !pm.Edited && !archiveDisabled, archiveObservedMS: observedArchiveMS, archiveSettingObservedMS: observedSettingMS}
+	stored := false
+	if storeOptions.archiveIncoming {
+		if ticket, queued := a.appStatePersist.reserveAfterPending(); queued {
+			// Store content synchronously; only reconcile its boundary again
+			// after older fetches have exposed their archive timestamps.
+			defer func() {
+				a.appStatePersist.completeOne(ticket, func() {
+					if !stored {
+						return
+					}
+					chat := canonicalJIDString(a.canonicalStoreJID(context.WithoutCancel(ctx), pm.Chat))
+					if err := a.db.ReconcileChatArchiveIncoming(chat, pm.ID, pm.Timestamp); err != nil {
+						for _, limit := range limits {
+							if limit != nil {
+								limit.persistenceFailed.Store(true)
+							}
+						}
+						a.emitWarning("archive_incoming_reconcile_failed", fmt.Sprintf("warning: failed to reconcile incoming archive state: %v", err), nil)
+					}
+				})
+			}()
+		}
+	}
+	if err := a.storeParsedMessageForSync(ctx, pm, storeOptions, limits...); err == nil {
+		stored = true
 		if incrementUnread {
 			a.incrementLiveUnread(ctx, pm)
 		}
@@ -648,6 +768,23 @@ func (a *App) handleHistorySync(ctx context.Context, opts SyncOptions, v *events
 			if pm.ID == "" || pm.Chat.IsEmpty() {
 				continue
 			}
+			unwrapped := (&events.Message{RawMessage: m.Message.GetMessage()}).UnwrapRaw()
+			if isSecretEdit(unwrapped.Message) {
+				evt, err := a.wa.ParseWebMessage(pm.Chat, m.Message)
+				if err != nil {
+					a.emitWarning(
+						"encrypted_edit_parse_failed",
+						fmt.Sprintf("warning: failed to parse encrypted edit %s: %v", pm.ID, err),
+						map[string]any{"message_id": pm.ID, "error": err.Error()},
+					)
+					continue
+				}
+				evt, ok := a.decryptSecretEdit(ctx, evt)
+				if !ok {
+					continue
+				}
+				pm = wa.ParseLiveMessage(evt)
+			}
 			var pollEvt *events.Message
 			if normalized, evt, ok := a.normalizeHistoryPollMessage(pm, m.Message); ok {
 				pm = normalized
@@ -667,7 +804,7 @@ func (a *App) handleHistorySync(ctx context.Context, opts SyncOptions, v *events
 			}
 			storedPM := pm
 			storedPM.UnhandledPayload = ""
-			if err := a.storeParsedMessageForSync(ctx, storedPM, limits...); err == nil {
+			if err := a.storeParsedMessageForSync(ctx, storedPM, messageStoreOptions{}, limits...); err == nil {
 				unhandledWarnings.observe(a, pm)
 				a.emitSyncProgress(messagesStored.Add(1))
 				if pm.Poll != nil || pm.PollAdd != nil || pm.PollVote != nil {
@@ -731,15 +868,29 @@ func (a *App) incrementLiveUnread(ctx context.Context, pm wa.ParsedMessage) {
 }
 
 func (a *App) shouldIncrementLiveUnread(ctx context.Context, pm wa.ParsedMessage) bool {
-	if pm.FromMe || pm.ID == "" || pm.Chat.IsEmpty() || pm.Chat == types.StatusBroadcastJID {
+	if pm.FromMe || pm.ID == "" || pm.Chat.IsEmpty() || pm.Chat == types.StatusBroadcastJID ||
+		!pm.HasContent() || pm.Revoked || pm.ReactionToID != "" || pm.ReactionEmoji != "" {
 		return false
 	}
 	chat := canonicalJIDString(a.canonicalStoreJID(ctx, pm.Chat))
 	if chat == "" {
 		return false
 	}
-	_, err := a.db.GetMessage(chat, pm.ID)
-	return errors.Is(err, sql.ErrNoRows)
+	existing, err := a.db.GetMessage(chat, pm.ID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return true
+	}
+	return err == nil && liveUnreadPlaceholder(existing)
+}
+
+// Contentless protocol rows never contributed unread content. Edits, deletion
+// tombstones and previously read payloads must remain duplicates even if empty.
+func liveUnreadPlaceholder(m store.Message) bool {
+	return m.DisplayText == "(message)" && strings.TrimSpace(m.Text) == "" &&
+		!m.FromMe && !m.Edited && !m.Revoked && !m.DeletedForMe &&
+		m.DeletedAt == nil && m.PayloadPurgedAt == nil &&
+		m.ReactionToID == "" && m.ReactionEmoji == "" &&
+		m.MediaType == "" && len(m.Buttons) == 0
 }
 
 func (a *App) storeHistoryUnreadCount(ctx context.Context, chatID string, conv *waHistorySync.Conversation) {
@@ -776,11 +927,11 @@ func (a *App) emitSyncProgress(total int64) {
 	a.emitOrPrint("progress", map[string]any{"messages_synced": total}, "\rSynced %d messages...", total)
 }
 
-func (a *App) storeParsedMessageForSync(ctx context.Context, pm wa.ParsedMessage, limits ...*syncStorageLimits) error {
+func (a *App) storeParsedMessageForSync(ctx context.Context, pm wa.ParsedMessage, options messageStoreOptions, limits ...*syncStorageLimits) error {
 	if len(limits) > 0 && limits[0] != nil {
-		return limits[0].StoreParsedMessage(ctx, pm)
+		return limits[0].StoreParsedMessage(ctx, pm, options)
 	}
-	return a.storeParsedMessage(ctx, pm)
+	return a.storeParsedMessage(ctx, pm, options)
 }
 
 func (a *App) decryptEncryptedReaction(ctx context.Context, pm *wa.ParsedMessage, msg *events.Message) {
@@ -802,6 +953,31 @@ func (a *App) decryptEncryptedReaction(ctx context.Context, pm *wa.ParsedMessage
 			pm.ReactionToID = key.GetID()
 		}
 	}
+}
+
+// Failure events do not identify the exact retry path. Even typed unavailable
+// messages can prompt a primary-device request, without guaranteeing recovery.
+func undecryptableWarning(v *events.UndecryptableMessage) (recovery, warning string) {
+	what := fmt.Sprintf("message %s in %s from %s", v.Info.ID, v.Info.Chat, v.Info.Sender)
+	if v.UnavailableType != events.UnavailableTypeUnknown {
+		return "requested_if_possible", fmt.Sprintf(
+			"warning: %s was reported unavailable (%s); recovery depends on WhatsApp and a readable copy may not arrive",
+			what, v.UnavailableType)
+	}
+	arrival := "decryption failed"
+	if v.IsUnavailable {
+		arrival = "nothing readable arrived"
+	}
+	return "requested_if_possible", fmt.Sprintf(
+		"warning: could not read %s (%s, fail mode %s); a copy is asked back where the failure allows it, so the message can stay missing here",
+		what, arrival, undecryptableFailMode(v.DecryptFailMode))
+}
+
+func undecryptableFailMode(mode events.DecryptFailMode) string {
+	if mode == events.DecryptFailShow {
+		return "show"
+	}
+	return string(mode)
 }
 
 // sendPresence sends a global presence update if the WhatsApp client is ready.

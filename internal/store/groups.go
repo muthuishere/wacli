@@ -110,12 +110,33 @@ func (d *DB) ReplaceGroupParticipants(groupJID string, participants []GroupParti
 	return tx.Commit()
 }
 
+func (d *DB) ListGroupParticipants(groupJID string) ([]GroupParticipant, error) {
+	groupJID = strings.TrimSpace(groupJID)
+	if groupJID == "" {
+		return nil, fmt.Errorf("group JID is required")
+	}
+	rows, err := d.q.ListGroupParticipants(storeCtx(), groupJID)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]GroupParticipant, 0, len(rows))
+	for _, r := range rows {
+		out = append(out, GroupParticipant{
+			GroupJID:  r.GroupJid,
+			UserJID:   r.UserJid,
+			Role:      r.Role,
+			UpdatedAt: fromUnix(r.UpdatedAt),
+		})
+	}
+	return out, nil
+}
+
 func (d *DB) ListGroups(query string, limit int) ([]Group, error) {
 	if limit <= 0 {
 		limit = 50
 	}
 	q := `SELECT jid, COALESCE(name,''), COALESCE(owner_jid,''), is_parent, COALESCE(linked_parent_jid,''), COALESCE(created_ts,0), COALESCE(left_at,0), updated_at FROM groups WHERE left_at IS NULL`
-	var args []interface{}
+	var args []any
 	if strings.TrimSpace(query) != "" {
 		needle := likeContains(query)
 		q += ` AND (LOWER(name) LIKE LOWER(?) ESCAPE '\' OR LOWER(jid) LIKE LOWER(?) ESCAPE '\')`

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -19,6 +20,7 @@ import (
 	"go.mau.fi/whatsmeow/proto/waE2E"
 	"go.mau.fi/whatsmeow/proto/waHistorySync"
 	"go.mau.fi/whatsmeow/proto/waWeb"
+	waStore "go.mau.fi/whatsmeow/store"
 	"go.mau.fi/whatsmeow/types"
 	"go.mau.fi/whatsmeow/types/events"
 )
@@ -32,9 +34,9 @@ type fakeWA struct {
 	linkedLID     string
 
 	nextHandlerID uint32
-	handlers      map[uint32]func(interface{})
+	handlers      map[uint32]func(any)
 
-	connectEvents  []interface{}
+	connectEvents  []any
 	connectErrs    []error
 	connectCalls   int
 	connectDelay   time.Duration
@@ -42,13 +44,23 @@ type fakeWA struct {
 	downloadDelay  time.Duration
 	downloadErr    error
 
-	onMediaRetry       func(info *types.MessageInfo, mediaKey []byte) interface{}
+	onMediaRetry       func(info *types.MessageInfo, mediaKey []byte) any
 	mediaRetryReceipts []string
 
 	contacts map[types.JID]types.ContactInfo
-	groups   map[types.JID]*types.GroupInfo
-	news     map[types.JID]*types.NewsletterMetadata
-	lids     map[types.JID]types.JID
+	// journal is the real wa.ContactStoreJournal over the fake contact store,
+	// as session.go installs it over whatsmeow's; applyContactBatch writes
+	// through it the way dispatchAppState does. contactStoreErr makes the
+	// inner store fail for a JID while the write is still journaled.
+	journal         *wa.ContactStoreJournal
+	contactStoreErr map[types.JID]error
+	groups          map[types.JID]*types.GroupInfo
+	news            map[types.JID]*types.NewsletterMetadata
+	lids            map[types.JID]types.JID
+
+	groupInfoCalls int
+	groupInfoErr   error
+	onGroupInfo    func() // runs while a group info lookup is in flight
 
 	getAllContactsErr           error
 	getJoinedGroupsErr          error
@@ -60,28 +72,51 @@ type fakeWA struct {
 	decryptPollVoteFunc         func(evt *events.Message) (*waE2E.PollVoteMessage, error)
 	decryptSecretFunc           func(evt *events.Message) (*waE2E.Message, error)
 	onDemandHistory             func(lastKnown types.MessageInfo, count int) *events.HistorySync
-	onDemandEvent               func(lastKnown types.MessageInfo, count int) interface{}
+	onDemandEvent               func(lastKnown types.MessageInfo, count int) any
 	onDemandErr                 error
 	downloadHistory             func(notif *waE2E.HistorySyncNotification) (*waHistorySync.HistorySync, error)
 	deleteHistoryCalls          []*waE2E.HistorySyncNotification
 	appStateRecoveryErr         error
-	onAppStateRecovery          func(name string)
-	appStateFetchErr            error
-	appStateFetchErrs           []error
-	appStateFetchEvent          func(name string, fullSync, onlyIfNotSynced bool) interface{}
-	archiveEvent                func() interface{}
-	archiveErr                  error
-	archiveCalls                []fakeArchiveCall
-	pinCalls                    []fakePinCall
-	muteCalls                   []fakeMuteCall
-	markReadCalls               []fakeMarkReadCall
-	markReadBeforeApply         func()
-	manualHistorySyncCalls      []bool
-	appStateRecoveries          []string
-	appStateFetches             []fakeAppStateFetch
+	saveContactCalls            []fakeSaveContactCall
+	saveContactErr              error
+	saveContactAfterSend        func(call fakeSaveContactCall)
+	// saveContactErrAfterSend fails the send after saveContactAfterSend ran,
+	// like a 409 retry or a post-send fetch that fails after whatsmeow
+	// already applied (and journaled) a batch.
+	saveContactErrAfterSend error
+	onAppStateRecovery      func(name string)
+	appStateFetchErr        error
+	appStateFetchErrs       []error
+	appStateFetchEvent      func(name string, fullSync, onlyIfNotSynced bool) any
+	archiveEvent            func() any
+	archiveErr              error
+	archiveCalls            []fakeArchiveCall
+	pinCalls                []fakePinCall
+	muteCalls               []fakeMuteCall
+	markReadCalls           []fakeMarkReadCall
+	markReadBeforeApply     func()
+	markReadAfterApply      func()
+	readReceiptCalls        []fakeReadReceiptCall
+	onReadReceipt           func(int) (types.ReceiptType, error)
+	readReceiptErr          error
+	readReceiptType         types.ReceiptType
+	manualHistorySyncCalls  []bool
+	appStateRecoveries      []string
+	appStateFetches         []fakeAppStateFetch
+	hasLocalAppState        bool
 
 	presenceCalls   []types.Presence
 	sendPresenceErr error
+
+	presenceSubscriptions []types.JID
+	subscribePresenceErr  error
+	// presenceSubscribeAttempts records every call, failed ones included;
+	// slowSubscribePresence, when set, runs first and can stall or fail one.
+	presenceSubscribeAttempts []types.JID
+	slowSubscribePresence     func(context.Context, types.JID) error
+	// onSubscribePresence, when set, returns an event emitted as WhatsApp's
+	// answer before SubscribePresence returns (nil emits nothing).
+	onSubscribePresence func(types.JID) any
 }
 
 type fakeArchiveCall struct {
@@ -109,6 +144,14 @@ type fakeMarkReadCall struct {
 	lastMsgKey *waCommon.MessageKey
 }
 
+type fakeReadReceiptCall struct {
+	ids        []types.MessageID
+	timestamp  time.Time
+	chat       types.JID
+	sender     types.JID
+	addressing types.AddressingMode
+}
+
 type fakeSendPollCall struct {
 	to         types.JID
 	name       string
@@ -129,23 +172,82 @@ type fakeAppStateFetch struct {
 }
 
 func newFakeWA() *fakeWA {
-	return &fakeWA{
-		authed:        true,
-		autoReconnect: true,
-		handlers:      map[uint32]func(interface{}){},
-		contacts:      map[types.JID]types.ContactInfo{},
-		groups:        map[types.JID]*types.GroupInfo{},
-		news:          map[types.JID]*types.NewsletterMetadata{},
-		lids:          map[types.JID]types.JID{},
-		nextHandlerID: 1,
+	f := &fakeWA{
+		authed:          true,
+		autoReconnect:   true,
+		handlers:        map[uint32]func(any){},
+		contacts:        map[types.JID]types.ContactInfo{},
+		contactStoreErr: map[types.JID]error{},
+		groups:          map[types.JID]*types.GroupInfo{},
+		news:            map[types.JID]*types.NewsletterMetadata{},
+		lids:            map[types.JID]types.JID{},
+		nextHandlerID:   1,
 	}
+	f.journal = wa.NewContactStoreJournal(&fakeContactStore{f: f})
+	return f
 }
 
-func (f *fakeWA) emit(evt interface{}) {
+func (f *fakeWA) ContactJournal() *wa.ContactStoreJournal { return f.journal }
+
+// fakeContactStore is the whatsmeow contact store of the fake: independent
+// rows per raw JID (phone number or LID), names overwritten as a unit, like
+// sqlstore.PutContactName. Argument order follows the sqlstore implementation
+// and the SDK caller: (firstName, fullName).
+type fakeContactStore struct{ f *fakeWA }
+
+func (s *fakeContactStore) PutContactName(ctx context.Context, user types.JID, firstName, fullName string) error {
+	s.f.mu.Lock()
+	defer s.f.mu.Unlock()
+	if err := s.f.contactStoreErr[user]; err != nil {
+		return err
+	}
+	info := s.f.contacts[user]
+	info.Found = true
+	info.FirstName = firstName
+	info.FullName = fullName
+	s.f.contacts[user] = info
+	return nil
+}
+
+func (s *fakeContactStore) PutAllContactNames(ctx context.Context, contacts []waStore.ContactEntry) error {
+	for _, c := range contacts {
+		if err := s.PutContactName(ctx, c.JID, c.FirstName, c.FullName); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *fakeContactStore) PutPushName(ctx context.Context, user types.JID, pushName string) (bool, string, error) {
+	return false, "", nil
+}
+
+func (s *fakeContactStore) PutBusinessName(ctx context.Context, user types.JID, businessName string) (bool, string, error) {
+	return false, "", nil
+}
+
+func (s *fakeContactStore) PutManyRedactedPhones(ctx context.Context, entries []waStore.RedactedPhoneEntry) error {
+	return nil
+}
+
+func (s *fakeContactStore) GetContact(ctx context.Context, user types.JID) (types.ContactInfo, error) {
+	return s.f.GetContact(ctx, user)
+}
+
+func (s *fakeContactStore) GetAllContacts(ctx context.Context) (map[types.JID]types.ContactInfo, error) {
+	return s.f.GetAllContacts(ctx)
+}
+
+func (f *fakeWA) emit(evt any) {
 	f.mu.Lock()
-	handlers := make([]func(interface{}), 0, len(f.handlers))
-	for _, h := range f.handlers {
-		handlers = append(handlers, h)
+	ids := make([]uint32, 0, len(f.handlers))
+	for id := range f.handlers {
+		ids = append(ids, id)
+	}
+	slices.Sort(ids)
+	handlers := make([]func(any), 0, len(ids))
+	for _, id := range ids {
+		handlers = append(handlers, f.handlers[id])
 	}
 	f.mu.Unlock()
 	for _, h := range handlers {
@@ -153,7 +255,8 @@ func (f *fakeWA) emit(evt interface{}) {
 	}
 }
 
-func (f *fakeWA) Close() { f.mu.Lock(); f.connected = false; f.mu.Unlock() }
+func (f *fakeWA) Close()      { f.Disconnect() }
+func (f *fakeWA) Disconnect() { f.mu.Lock(); f.connected = false; f.mu.Unlock() }
 
 func (f *fakeWA) IsAuthed() bool { f.mu.Lock(); defer f.mu.Unlock(); return f.authed }
 func (f *fakeWA) IsConnected() bool {
@@ -193,7 +296,7 @@ func (f *fakeWA) Connect(ctx context.Context, opts wa.ConnectOptions) error {
 		f.connectErrs = f.connectErrs[1:]
 	}
 	f.connected = true
-	eventsToEmit := append([]interface{}{}, f.connectEvents...)
+	eventsToEmit := append([]any{}, f.connectEvents...)
 	f.mu.Unlock()
 
 	if !authed && !opts.AllowQR {
@@ -225,7 +328,7 @@ func (f *fakeWA) Connect(ctx context.Context, opts wa.ConnectOptions) error {
 	return nil
 }
 
-func (f *fakeWA) AddEventHandler(handler func(interface{})) uint32 {
+func (f *fakeWA) AddEventHandler(handler func(any)) uint32 {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	id := f.nextHandlerID
@@ -336,7 +439,17 @@ func (f *fakeWA) GetJoinedGroups(ctx context.Context) ([]*types.GroupInfo, error
 
 func (f *fakeWA) GetGroupInfo(ctx context.Context, jid types.JID) (*types.GroupInfo, error) {
 	f.mu.Lock()
+	f.groupInfoCalls++
+	hook := f.onGroupInfo
+	f.mu.Unlock()
+	if hook != nil {
+		hook()
+	}
+	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.groupInfoErr != nil {
+		return nil, f.groupInfoErr
+	}
 	return f.groups[jid], nil
 }
 
@@ -589,6 +702,33 @@ func (f *fakeWA) SendPresence(ctx context.Context, presence types.Presence) erro
 	return f.sendPresenceErr
 }
 
+func (f *fakeWA) SubscribePresence(ctx context.Context, jid types.JID) error {
+	f.mu.Lock()
+	f.presenceSubscribeAttempts = append(f.presenceSubscribeAttempts, jid)
+	slow := f.slowSubscribePresence
+	f.mu.Unlock()
+	if slow != nil {
+		if err := slow(ctx, jid); err != nil {
+			return err
+		}
+	}
+	f.mu.Lock()
+	if f.subscribePresenceErr != nil {
+		err := f.subscribePresenceErr
+		f.mu.Unlock()
+		return err
+	}
+	f.presenceSubscriptions = append(f.presenceSubscriptions, jid)
+	hook := f.onSubscribePresence
+	f.mu.Unlock()
+	if hook != nil {
+		if evt := hook(jid); evt != nil {
+			f.emit(evt)
+		}
+	}
+	return nil
+}
+
 func (f *fakeWA) DecryptReaction(ctx context.Context, reaction *events.Message) (*waProto.ReactionMessage, error) {
 	if f.decryptReactionErr != nil {
 		return nil, f.decryptReactionErr
@@ -696,6 +836,26 @@ func (f *fakeWA) SendMediaRetryReceipt(ctx context.Context, info *types.MessageI
 	return nil
 }
 
+func (f *fakeWA) MarkRead(ctx context.Context, ids []types.MessageID, timestamp time.Time, chat, sender types.JID, addressing types.AddressingMode) (types.ReceiptType, error) {
+	f.mu.Lock()
+	if f.readReceiptErr != nil {
+		err := f.readReceiptErr
+		f.mu.Unlock()
+		return "", err
+	}
+	f.readReceiptCalls = append(f.readReceiptCalls, fakeReadReceiptCall{ids: append([]types.MessageID(nil), ids...), timestamp: timestamp, chat: chat, sender: sender, addressing: addressing})
+	index := len(f.readReceiptCalls) - 1
+	hook, kind := f.onReadReceipt, f.readReceiptType
+	f.mu.Unlock()
+	if hook != nil {
+		return hook(index)
+	}
+	if kind != "" {
+		return kind, nil
+	}
+	return wa.ReadReceiptUnknown, nil
+}
+
 func (f *fakeWA) RequestHistorySyncOnDemand(ctx context.Context, lastKnown types.MessageInfo, count int) (types.MessageID, error) {
 	f.mu.Lock()
 	if f.onDemandErr != nil {
@@ -718,6 +878,25 @@ func (f *fakeWA) RequestHistorySyncOnDemand(ctx context.Context, lastKnown types
 	return types.MessageID("req"), nil
 }
 
+func (f *fakeWA) HasLocalAppState(ctx context.Context, name string) (bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.hasLocalAppState, nil
+}
+
+// noteFullSyncResult models stock whatsmeow's destructive full sync:
+// fetchAppState deletes the saved collection version before decoding, so a
+// failed full sync leaves no local app state behind, and a verified one
+// stores a fresh version.
+func (f *fakeWA) noteFullSyncResult(fullSync bool, err error) {
+	if !fullSync {
+		return
+	}
+	f.mu.Lock()
+	f.hasLocalAppState = err == nil
+	f.mu.Unlock()
+}
+
 func (f *fakeWA) RequestAppStateRecovery(ctx context.Context, name string) (types.MessageID, error) {
 	f.mu.Lock()
 	if f.appStateRecoveryErr != nil {
@@ -738,7 +917,7 @@ func (f *fakeWA) DeleteMessageForMe(ctx context.Context, info types.MessageInfo,
 	return nil
 }
 
-func (f *fakeWA) ArchiveChat(ctx context.Context, target types.JID, archive bool, lastMsgTS time.Time, lastMsgKey *waCommon.MessageKey, beforeApply func()) ([]interface{}, error) {
+func (f *fakeWA) ArchiveChat(ctx context.Context, target types.JID, archive bool, lastMsgTS time.Time, lastMsgKey *waCommon.MessageKey, beforeApply func()) ([]any, error) {
 	f.mu.Lock()
 	f.archiveCalls = append(f.archiveCalls, fakeArchiveCall{target: target, archive: archive, lastMsgTS: lastMsgTS, lastMsgKey: lastMsgKey})
 	eventCB := f.archiveEvent
@@ -746,13 +925,13 @@ func (f *fakeWA) ArchiveChat(ctx context.Context, target types.JID, archive bool
 	beforeApply()
 	if eventCB != nil {
 		if evt := eventCB(); evt != nil {
-			return []interface{}{evt}, f.archiveErr
+			return []any{evt}, f.archiveErr
 		}
 	}
 	return nil, f.archiveErr
 }
 
-func (f *fakeWA) PinChat(ctx context.Context, target types.JID, pin bool, beforeApply func()) ([]interface{}, error) {
+func (f *fakeWA) PinChat(ctx context.Context, target types.JID, pin bool, beforeApply func()) ([]any, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.pinCalls = append(f.pinCalls, fakePinCall{target: target, pin: pin})
@@ -760,7 +939,7 @@ func (f *fakeWA) PinChat(ctx context.Context, target types.JID, pin bool, before
 	return nil, nil
 }
 
-func (f *fakeWA) MuteChat(ctx context.Context, target types.JID, mute bool, duration time.Duration, beforeApply func()) ([]interface{}, error) {
+func (f *fakeWA) MuteChat(ctx context.Context, target types.JID, mute bool, duration time.Duration, beforeApply func()) ([]any, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.muteCalls = append(f.muteCalls, fakeMuteCall{target: target, mute: mute, duration: duration})
@@ -768,15 +947,19 @@ func (f *fakeWA) MuteChat(ctx context.Context, target types.JID, mute bool, dura
 	return nil, nil
 }
 
-func (f *fakeWA) MarkChatAsRead(ctx context.Context, target types.JID, read bool, lastMsgTS time.Time, lastMsgKey *waCommon.MessageKey, beforeApply func()) ([]interface{}, error) {
+func (f *fakeWA) MarkChatAsRead(ctx context.Context, target types.JID, read bool, lastMsgTS time.Time, lastMsgKey *waCommon.MessageKey, beforeApply func()) ([]any, error) {
 	f.mu.Lock()
 	f.markReadCalls = append(f.markReadCalls, fakeMarkReadCall{target: target, read: read, lastMsgTS: lastMsgTS, lastMsgKey: lastMsgKey})
 	hook := f.markReadBeforeApply
+	afterApply := f.markReadAfterApply
 	f.mu.Unlock()
 	if hook != nil {
 		hook()
 	}
 	beforeApply()
+	if afterApply != nil {
+		afterApply()
+	}
 	return nil, nil
 }
 
@@ -805,7 +988,7 @@ func (f *fakeWA) FetchAppState(ctx context.Context, name string, fullSync, onlyI
 	return nil
 }
 
-func (f *fakeWA) FetchAppStateEvents(ctx context.Context, name string, fullSync, onlyIfNotSynced bool) ([]interface{}, error) {
+func (f *fakeWA) FetchAppStateEvents(ctx context.Context, name string, fullSync, onlyIfNotSynced bool) ([]any, error) {
 	f.mu.Lock()
 	f.appStateFetches = append(f.appStateFetches, fakeAppStateFetch{
 		name:            name,
@@ -819,6 +1002,7 @@ func (f *fakeWA) FetchAppStateEvents(ctx context.Context, name string, fullSync,
 	}
 	eventCB := f.appStateFetchEvent
 	f.mu.Unlock()
+	f.noteFullSyncResult(fullSync, err)
 	if err != nil {
 		if !errors.Is(err, appstate.ErrKeyNotFound) {
 			f.emit(&events.AppStateSyncError{Name: appstate.WAPatchName(name), FullSync: fullSync, Error: err})
@@ -832,7 +1016,7 @@ func (f *fakeWA) FetchAppStateEvents(ctx context.Context, name string, fullSync,
 	if evt == nil {
 		return nil, nil
 	}
-	return []interface{}{evt}, nil
+	return []any{evt}, nil
 }
 
 func (f *fakeWA) Logout(ctx context.Context) error {
@@ -858,6 +1042,76 @@ func (f *fakeWA) SetProfileName(ctx context.Context, name string) error {
 	return nil
 }
 
+type fakeSaveContactCall struct {
+	target, lid         types.JID
+	fullName, firstName string
+	phonebook           bool
+}
+
+// SendAppStatePatch models whatsmeow's SendAppState: the persistence boundary runs
+// before the send, then afterSend models the post-send fetch, whose events
+// whatsmeow dispatches from a goroutine before returning. Without afterSend,
+// a successful send models the plain post-send fetch: whatsmeow fetches the
+// collection from the version the patch was built on, so the batch holds our
+// own mutation (indexed by the phone number, as BuildSaveContact emits it),
+// which it writes to its contact store before SendAppState returns.
+func (f *fakeWA) SendAppStatePatch(ctx context.Context, patch appstate.PatchInfo, beforeApply func()) ([]any, error) {
+	action := patch.Mutations[0].Value.GetContactAction()
+	target, _ := types.ParseJID(action.GetPnJID())
+	lid, _ := types.ParseJID(action.GetLidJID())
+	call := fakeSaveContactCall{target: target, lid: lid, fullName: action.GetFullName(), firstName: action.GetFirstName(), phonebook: action.GetSaveOnPrimaryAddressbook()}
+	f.mu.Lock()
+	f.saveContactCalls = append(f.saveContactCalls, call)
+	err := f.saveContactErr
+	errAfterSend := f.saveContactErrAfterSend
+	afterSend := f.saveContactAfterSend
+	f.mu.Unlock()
+	beforeApply()
+	if err != nil {
+		return nil, err
+	}
+	if afterSend != nil {
+		afterSend(call)
+	} else {
+		f.applyContactBatch(contactEvent(call.target, call.fullName, call.firstName))()
+	}
+	return nil, errAfterSend
+}
+
+// applyContactBatch models whatsmeow applying one fetched batch of contact
+// mutations: dispatchAppState writes every name to the session contact store
+// synchronously, inside fetchAppState (so before SendAppState returns), with
+// PutContactName(ctx, jid, act.GetFirstName(), act.GetFullName()), and only
+// the events are handed to a goroutine. The store is written now, through
+// the real journal; the returned func dispatches the batch's events,
+// whenever that goroutine runs.
+func (f *fakeWA) applyContactBatch(evts ...*events.Contact) func() {
+	// Each mutation is its own patch: DecodePatches stores every patch's
+	// version before any name of the batch is applied.
+	for range evts {
+		f.journal.NoteCursorWrite(string(appstate.WAPatchCriticalUnblockLow))
+	}
+	batch := make([]any, 0, len(evts))
+	for _, evt := range evts {
+		_ = f.journal.PutContactName(context.Background(), evt.JID, evt.Action.GetFirstName(), evt.Action.GetFullName())
+		batch = append(batch, evt)
+	}
+	return func() { f.dispatchAsync(batch...) }
+}
+
+// dispatchAsync delivers events from a goroutine, like whatsmeow's post-send
+// dispatch, and returns once every handler has been called.
+func (f *fakeWA) dispatchAsync(evts ...any) {
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for _, evt := range evts {
+			f.emit(evt)
+		}
+	}()
+	<-done
+}
+
 func (f *fakeWA) GetBusinessProfile(ctx context.Context, jid types.JID) (*types.BusinessProfile, error) {
 	return &types.BusinessProfile{JID: jid}, nil
 }
@@ -876,4 +1130,8 @@ func (f *fakeWA) LinkedLID() string {
 		return ""
 	}
 	return f.linkedLID
+}
+
+func (f *fakeWA) DownloadRetriedMediaToFile(ctx context.Context, directPath string, fileHash, mediaKey []byte, fileLength uint64, mediaType, targetPath string) (int64, error) {
+	return f.DownloadMediaToFile(ctx, directPath, nil, fileHash, mediaKey, fileLength, mediaType, "", targetPath)
 }

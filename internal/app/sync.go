@@ -13,8 +13,8 @@ import (
 	"github.com/openclaw/wacli/internal/store"
 	"github.com/openclaw/wacli/internal/wa"
 	"go.mau.fi/whatsmeow"
-	"go.mau.fi/whatsmeow/appstate"
 	"go.mau.fi/whatsmeow/types"
+	"go.mau.fi/whatsmeow/types/events"
 )
 
 const maxAuthConnectAttempts = 3
@@ -78,7 +78,7 @@ type SyncOptions struct {
 	WebhookSecret       string
 	WebhookAllowPrivate bool
 	WebhookEvents       SyncWebhookEventSet // nil = messages only
-	Verbosity           int                 // future
+	afterHistorySync    func(*events.HistorySync)
 }
 
 type SyncResult struct {
@@ -95,6 +95,9 @@ func (a *App) Sync(ctx context.Context, opts SyncOptions) (SyncResult, error) {
 	if opts.PresenceMode == "" {
 		opts.PresenceMode = SyncPresenceModeNormal
 	}
+	// A quiet sync never shows as available, so WhatsApp would send nothing
+	// to a presence subscription delegated to it.
+	a.presenceWatch.setQuiet(!opts.PresenceMode.SendsAvailablePresence())
 	if (opts.Mode == SyncModeBootstrap || opts.Mode == SyncModeOnce) && opts.IdleExit <= 0 {
 		opts.IdleExit = 30 * time.Second
 	}
@@ -174,7 +177,7 @@ func (a *App) Sync(ctx context.Context, opts SyncOptions) (SyncResult, error) {
 	}
 
 	ps := &syncPresence{}
-	handlerID := a.addSyncEventHandler(syncCtx, opts, &messagesStored, &lastEvent, disconnected, loggedOut, staleReconnect, enqueueMedia, enqueueWebhook, limits, ps, mediaQ)
+	handlerID, appStateRecoveries := a.addSyncEventHandler(syncCtx, opts, &messagesStored, &lastEvent, disconnected, loggedOut, staleReconnect, enqueueMedia, enqueueWebhook, limits, ps, mediaQ)
 	defer a.wa.RemoveEventHandler(handlerID)
 
 	connectionEpoch.Store(nowUTC().UnixNano())
@@ -190,6 +193,8 @@ func (a *App) Sync(ctx context.Context, opts SyncOptions) (SyncResult, error) {
 		ps.cleanupStarted = true
 		ps.mu.Unlock()
 		a.wa.RemoveEventHandler(handlerID)
+		// No presence subscription goes out after this device leaves.
+		a.presenceWatch.stopRenewal()
 		a.sendPresenceBounded(types.PresenceUnavailable)
 	}()
 	now = nowUTC().UnixNano()
@@ -197,7 +202,7 @@ func (a *App) Sync(ctx context.Context, opts SyncOptions) (SyncResult, error) {
 	if err := a.migrateHistoricalLIDs(syncCtx); err != nil {
 		return SyncResult{MessagesStored: messagesStored.Load()}, err
 	}
-	a.syncAppStateDeltas(syncCtx)
+	a.syncAppStateDeltas(syncCtx, appStateRecoveries)
 
 	// Optional: bootstrap imports (helps contacts/groups management without waiting for events).
 	if opts.RefreshContacts {
@@ -253,20 +258,12 @@ func (a *App) Sync(ctx context.Context, opts SyncOptions) (SyncResult, error) {
 	if err != nil {
 		return SyncResult{MessagesStored: messagesStored.Load()}, err
 	}
-	return SyncResult{MessagesStored: messagesStored.Load()}, nil
-}
-
-func (a *App) syncAppStateDeltas(ctx context.Context) {
-	for _, name := range []appstate.WAPatchName{appstate.WAPatchRegularHigh, appstate.WAPatchRegularLow, appstate.WAPatchRegular} {
-		fullSync := name == appstate.WAPatchRegular
-		if err := a.wa.FetchAppState(ctx, string(name), fullSync, false); err != nil {
-			a.emitWarning(
-				"app_state_sync_failed",
-				fmt.Sprintf("warning: failed to sync WhatsApp app state %s: %v", name, err),
-				map[string]any{"name": string(name), "error": err.Error()},
-			)
+	if opts.Mode != SyncModeFollow && syncCtx.Err() == nil && limits.canRecordFreshness() && a.wa.IsConnected() && a.wa.IsAuthed() {
+		if err := a.db.RecordSuccessfulSync(nowUTC()); err != nil {
+			return SyncResult{MessagesStored: messagesStored.Load()}, fmt.Errorf("record successful sync: %w", err)
 		}
 	}
+	return SyncResult{MessagesStored: messagesStored.Load()}, nil
 }
 
 func (a *App) connectForSync(ctx context.Context, opts SyncOptions) error {
@@ -397,13 +394,37 @@ func chatKind(chat types.JID) string {
 	return "unknown"
 }
 
-func (a *App) storeParsedMessage(ctx context.Context, pm wa.ParsedMessage) error {
+// Content-free messages must not move the chat's activity timestamp.
+func (a *App) upsertMessageChat(pm wa.ParsedMessage, name string) error {
+	jid := canonicalJIDString(pm.Chat)
+	if pm.HasContent() {
+		return a.db.UpsertChat(jid, chatKind(pm.Chat), name, pm.Timestamp)
+	}
+	return a.db.UpsertChatMetadata(jid, chatKind(pm.Chat), name)
+}
+
+type messageStoreOptions struct {
+	archiveIncoming          bool
+	archiveObservedMS        int64
+	archiveSettingObservedMS int64
+}
+
+func (a *App) storeParsedMessage(ctx context.Context, pm wa.ParsedMessage, options messageStoreOptions) error {
 	pm.Chat = a.canonicalStoreJID(ctx, pm.Chat)
 	chatJID := canonicalJIDString(pm.Chat)
-	chatName := a.wa.ResolveChatName(ctx, pm.Chat, pm.PushName)
-	if pm.Chat != types.StatusBroadcastJID {
-		if err := a.db.UpsertChat(chatJID, chatKind(pm.Chat), chatName, pm.Timestamp); err != nil {
+	var chatName string
+	if pm.Chat.Server == types.GroupServer {
+		var err error
+		chatName, err = a.storeGroupChat(ctx, pm)
+		if err != nil {
 			return err
+		}
+	} else {
+		chatName = a.wa.ResolveChatName(ctx, pm.Chat, pm.PushName)
+		if pm.Chat != types.StatusBroadcastJID {
+			if err := a.upsertMessageChat(pm, chatName); err != nil {
+				return err
+			}
 		}
 	}
 
@@ -449,29 +470,6 @@ func (a *App) storeParsedMessage(ctx context.Context, pm wa.ParsedMessage) error
 		}
 	}
 
-	// Best-effort: store group metadata (and participants) when available.
-	if pm.Chat.Server == types.GroupServer {
-		if gi, err := a.wa.GetGroupInfo(ctx, pm.Chat); err == nil && gi != nil {
-			ownerJID := a.canonicalStoreJID(ctx, gi.OwnerJID).String()
-			_ = a.db.UpsertGroupWithHierarchy(gi.JID.String(), gi.GroupName.Name, ownerJID, gi.GroupCreated, gi.IsParent, gi.LinkedParentJID.String())
-			var ps []store.GroupParticipant
-			for _, p := range gi.Participants {
-				role := "member"
-				if p.IsSuperAdmin {
-					role = "superadmin"
-				} else if p.IsAdmin {
-					role = "admin"
-				}
-				ps = append(ps, store.GroupParticipant{
-					GroupJID: pm.Chat.String(),
-					UserJID:  a.canonicalStoreJID(ctx, p.JID).String(),
-					Role:     role,
-				})
-			}
-			_ = a.db.ReplaceGroupParticipants(pm.Chat.String(), ps)
-		}
-	}
-
 	var mediaType, caption, filename, mimeType, directPath string
 	var mediaKey, fileSha, fileEncSha []byte
 	var fileLen uint64
@@ -513,33 +511,36 @@ func (a *App) storeParsedMessage(ctx context.Context, pm wa.ParsedMessage) error
 	}
 
 	if err := a.db.UpsertMessage(store.UpsertMessageParams{
-		ChatJID:         chatJID,
-		ChatName:        chatName,
-		MsgID:           pm.ID,
-		SenderJID:       senderJID,
-		SenderName:      senderName,
-		Timestamp:       pm.Timestamp,
-		FromMe:          pm.FromMe,
-		Text:            pm.Text,
-		DisplayText:     displayText,
-		QuotedMsgID:     pm.ReplyToID,
-		QuotedSenderJID: a.canonicalStoreJIDString(ctx, pm.ReplyToSenderJID),
-		Buttons:         waButtonsToStore(pm.Buttons),
-		IsForwarded:     pm.IsForwarded,
-		ForwardingScore: pm.ForwardingScore,
-		ReactionToID:    pm.ReactionToID,
-		ReactionEmoji:   pm.ReactionEmoji,
-		MediaType:       mediaType,
-		MediaCaption:    caption,
-		Filename:        filename,
-		MimeType:        mimeType,
-		DirectPath:      directPath,
-		MediaKey:        mediaKey,
-		FileSHA256:      fileSha,
-		FileEncSHA256:   fileEncSha,
-		FileLength:      fileLen,
-		Edited:          pm.Edited,
-		Revoked:         pm.Revoked,
+		ArchiveIncoming:          options.archiveIncoming,
+		ArchiveObservedMS:        options.archiveObservedMS,
+		ArchiveSettingObservedMS: options.archiveSettingObservedMS,
+		ChatJID:                  chatJID,
+		ChatName:                 chatName,
+		MsgID:                    pm.ID,
+		SenderJID:                senderJID,
+		SenderName:               senderName,
+		Timestamp:                pm.Timestamp,
+		FromMe:                   pm.FromMe,
+		Text:                     pm.Text,
+		DisplayText:              displayText,
+		QuotedMsgID:              pm.ReplyToID,
+		QuotedSenderJID:          a.canonicalStoreJIDString(ctx, pm.ReplyToSenderJID),
+		Buttons:                  waButtonsToStore(pm.Buttons),
+		IsForwarded:              pm.IsForwarded,
+		ForwardingScore:          pm.ForwardingScore,
+		ReactionToID:             pm.ReactionToID,
+		ReactionEmoji:            pm.ReactionEmoji,
+		MediaType:                mediaType,
+		MediaCaption:             caption,
+		Filename:                 filename,
+		MimeType:                 mimeType,
+		DirectPath:               directPath,
+		MediaKey:                 mediaKey,
+		FileSHA256:               fileSha,
+		FileEncSHA256:            fileEncSha,
+		FileLength:               fileLen,
+		Edited:                   pm.Edited,
+		Revoked:                  pm.Revoked,
 	}); err != nil {
 		return err
 	}

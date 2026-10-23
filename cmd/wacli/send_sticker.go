@@ -50,16 +50,16 @@ func sendSticker(ctx context.Context, a interface {
 		return sendFileOutcome{}, err
 	}
 
+	// Quote before uploading, as file sends do.
+	replyContext, err := buildReplyContextInfo(ctx, a.WA(), a.DB(), to, opts.replyTo, opts.replyToSender)
+	if err != nil {
+		return sendFileOutcome{}, err
+	}
 	uploadType, err := wa.MediaTypeFromString("sticker")
 	if err != nil {
 		return sendFileOutcome{}, err
 	}
 	up, err := a.WA().Upload(ctx, data, uploadType)
-	if err != nil {
-		return sendFileOutcome{}, err
-	}
-
-	replyContext, err := buildReplyContextInfo(a.DB(), to, opts.replyTo, opts.replyToSender)
 	if err != nil {
 		return sendFileOutcome{}, err
 	}
@@ -124,11 +124,6 @@ func newStickerMessage(up whatsmeow.UploadResponse, info *waProto.ContextInfo, m
 			ContextInfo:   info,
 		},
 	}
-}
-
-func isWebPStickerData(data []byte) bool {
-	_, err := parseWebPStickerMetadata(data)
-	return err == nil
 }
 
 func validateWebPSticker(data []byte) (webPStickerMetadata, error) {

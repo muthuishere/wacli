@@ -553,28 +553,60 @@ func TestWriteMessageShowIncludesForwardedMetadata(t *testing.T) {
 	}
 }
 
-func TestDeleteLocalMediaIfRequestedReportsActualRemoval(t *testing.T) {
+func TestDeleteLocalMediaPathsIfRequestedReportsActualRemoval(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "media.bin")
 	if err := os.WriteFile(path, []byte("media"), 0o600); err != nil {
 		t.Fatalf("WriteFile: %v", err)
 	}
-	deleted, err := deleteLocalMediaIfRequested(true, path)
+	deleted, err := deleteLocalMediaPathsIfRequested(true, []string{path})
 	if err != nil {
-		t.Fatalf("deleteLocalMediaIfRequested: %v", err)
+		t.Fatalf("deleteLocalMediaPathsIfRequested: %v", err)
 	}
-	if !deleted {
-		t.Fatal("deleted = false, want true")
+	if deleted != 1 {
+		t.Fatalf("deleted = %d, want 1", deleted)
 	}
-	deleted, err = deleteLocalMediaIfRequested(true, path)
+	deleted, err = deleteLocalMediaPathsIfRequested(true, []string{path})
 	if err != nil {
 		t.Fatalf("delete stale media path: %v", err)
 	}
-	if deleted {
-		t.Fatal("deleted stale path = true, want false")
+	if deleted != 0 {
+		t.Fatalf("deleted stale path = %d, want 0", deleted)
 	}
-	deleted, err = deleteLocalMediaIfRequested(false, path)
-	if err != nil || deleted {
-		t.Fatalf("delete disabled = %v, %v; want false, nil", deleted, err)
+	deleted, err = deleteLocalMediaPathsIfRequested(false, []string{path})
+	if err != nil || deleted != 0 {
+		t.Fatalf("delete disabled = %d, %v; want 0, nil", deleted, err)
+	}
+}
+
+func TestGetMessageByChatFilterCarriesDeliveryState(t *testing.T) {
+	db, err := store.Open(filepath.Join(t.TempDir(), "wacli.db"))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer db.Close()
+
+	chat := "15551234567@s.whatsapp.net"
+	now := time.Date(2024, 1, 1, 12, 0, 0, 0, time.UTC)
+	if err := db.UpsertChat(chat, "dm", "Alice", now); err != nil {
+		t.Fatalf("UpsertChat: %v", err)
+	}
+	if err := db.UpsertMessage(store.UpsertMessageParams{
+		ChatJID: chat, MsgID: "mid", Timestamp: now, FromMe: true, Text: "hello",
+	}); err != nil {
+		t.Fatalf("UpsertMessage: %v", err)
+	}
+	if err := db.UpsertMessageReceipt(chat, "mid", chat, "read", now.Add(time.Minute)); err != nil {
+		t.Fatalf("UpsertMessageReceipt: %v", err)
+	}
+
+	// `show` reads its own columns, so it has to ask for the counts separately
+	// or it would disagree with `list` about the same message.
+	msg, err := getMessageByChatFilter(db, []string{chat}, "mid")
+	if err != nil {
+		t.Fatalf("getMessageByChatFilter: %v", err)
+	}
+	if msg.DeliveredTo != 1 || msg.ReadBy != 1 {
+		t.Fatalf("delivery state = %d delivered, %d read; want 1 and 1", msg.DeliveredTo, msg.ReadBy)
 	}
 }
 

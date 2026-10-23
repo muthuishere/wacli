@@ -8,6 +8,7 @@ builds:
     binary: wacli
     env:
       - CGO_ENABLED=1
+      - MACOSX_DEPLOYMENT_TARGET=15.0
     flags:
       - -trimpath
     tags:
@@ -19,6 +20,8 @@ builds:
     goarch:
       - amd64
       - arm64
+    hooks:
+      post: bash scripts/check-macos-minimum.sh "{{ .Path }}"
 
 archives:
   - id: default
